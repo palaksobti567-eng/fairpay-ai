@@ -5,11 +5,12 @@
   "scripts": {
     "dev": "tsx watch src/app.ts",
     "build": "tsc",
-    "test:gemini": "tsx scripts/gemini-test.ts"
-
+    "test:gemini": "tsx scripts/gemini-test.ts",
+    "test:kernel": "tsx scripts/kernel-test.ts"
   },
   "dependencies": {
     "@ai-sdk/google": "^4.0.111",
+    "@onkernel/sdk": "^0.139.0",
     "ai": "^7.0.162",
     "dotenv": "^18.0.9",
     "express": "^5.3.0",
