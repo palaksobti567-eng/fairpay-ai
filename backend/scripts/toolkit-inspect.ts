@@ -6,8 +6,12 @@ const toolkit = new PayPalAgentToolkit({
   clientSecret: process.env.PAYPAL_CLIENT_SECRET as string,
   configuration: {
     actions: {
-      orders: { create: true, get: true },
-    },
+  orders: {
+    create: true,
+    get: true,
+    capture: true,
+  },
+},
     context: { sandbox: true },
   },
 });
