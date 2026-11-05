@@ -1,9 +1,11 @@
-import { requireAuth, requireRole } from "../middleware/auth.middleware";
+
 import { Router } from "express";
 import User from "../models/User";
 import { hashPassword, comparePassword } from "../utils/password";
 import { generateToken } from "../utils/jwt";
 import { registerSchema, loginSchema } from "../validators/auth.validator";
+import { requireAuth } from "../middleware/auth.middleware";
+import { sendError } from "../utils/errors";
 
 const router = Router();
 
@@ -13,7 +15,13 @@ router.post("/register", async (req, res) => {
     const parsed = registerSchema.safeParse(req.body);
 
     if (!parsed.success) {
-      return res.status(400).json({ message: "Invalid registration data", errors: parsed.error.issues });
+      return sendError(
+        res,
+        400,
+        "VALIDATION_ERROR",
+        "Invalid registration data",
+        parsed.error.issues
+      );
     }
 
     const { name, email, password } = parsed.data;
@@ -21,7 +29,12 @@ router.post("/register", async (req, res) => {
     const existingUser = await User.findOne({ email });
 
     if (existingUser) {
-      return res.status(409).json({ message: "Email already registered" });
+      return sendError(
+        res,
+        409,
+        "EMAIL_TAKEN",
+        "Email already registered"
+      );
     }
 
     const passwordHash = await hashPassword(password);
@@ -47,11 +60,20 @@ router.post("/register", async (req, res) => {
     });
   } catch (error: any) {
     if (error?.code === 11000) {
-      return res.status(409).json({ message: "Email already registered" });
+      return sendError(
+        res,
+        409,
+        "EMAIL_TAKEN",
+        "Email already registered"
+      );
     }
 
-    console.error("Registration error:", error);
-    return res.status(500).json({ message: "Internal server error" });
+    return sendError(
+      res,
+      500,
+      "INTERNAL_ERROR",
+      "Internal server error"
+    );
   }
 });
 
@@ -61,7 +83,13 @@ router.post("/login", async (req, res) => {
     const parsed = loginSchema.safeParse(req.body);
 
     if (!parsed.success) {
-      return res.status(400).json({ message: "Invalid login data" });
+      return sendError(
+        res,
+        400,
+        "VALIDATION_ERROR",
+        "Invalid login data",
+        parsed.error.issues
+      );
     }
 
     const { email, password } = parsed.data;
@@ -69,7 +97,12 @@ router.post("/login", async (req, res) => {
     const user = await User.findOne({ email }).select("+passwordHash");
 
     if (!user || !(await comparePassword(password, user.passwordHash))) {
-      return res.status(401).json({ message: "Invalid email or password" });
+      return sendError(
+        res,
+        401,
+        "INVALID_CREDENTIALS",
+        "Invalid email or password"
+      );
     }
 
     const token = generateToken(user._id.toString());
@@ -84,11 +117,17 @@ router.post("/login", async (req, res) => {
         role: user.role,
       },
     });
-  } catch (error) {
-    console.error("Login error:", error);
-    return res.status(500).json({ message: "Internal server error" });
+  } catch {
+    return sendError(
+      res,
+      500,
+      "INTERNAL_ERROR",
+      "Internal server error"
+    );
   }
 });
+
+// GET CURRENT USER
 router.get("/me", requireAuth, (req, res) => {
   const user = req.user!;
 
@@ -102,15 +141,5 @@ router.get("/me", requireAuth, (req, res) => {
     },
   });
 });
-// TEMPORARY ROLE AUTHORIZATION TEST
-router.get(
-  "/freelancer-test",
-  requireAuth,
-  requireRole("freelancer"),
-  (req, res) => {
-    return res.status(200).json({
-      message: "Freelancer access granted",
-    });
-  }
-);
+
 export default router;

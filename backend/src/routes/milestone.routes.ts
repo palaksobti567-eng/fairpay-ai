@@ -4,24 +4,10 @@ import mongoose from "mongoose";
 import Milestone from "../models/Milestone";
 import Project from "../models/Project";
 import { requireAuth } from "../middleware/auth.middleware";
+import { sendError } from "../utils/errors";
 import { updateMilestoneSchema } from "../validators/milestone.validator";
 
 const router = Router();
-
-function sendError(
-  res: Response,
-  status: number,
-  code: string,
-  message: string
-) {
-  return res.status(status).json({
-    error: {
-      code,
-      message,
-      details: [],
-    },
-  });
-}
 
 // PATCH /api/milestones/:id - Update a draft milestone
 router.patch(
@@ -38,25 +24,25 @@ router.patch(
       const parsed = updateMilestoneSchema.safeParse(req.body);
 
       if (!parsed.success) {
-        return res.status(400).json({
-          error: {
-            code: "VALIDATION_ERROR",
-            message: "Invalid milestone data",
-            details: parsed.error.issues,
-          },
-        });
+        return sendError(
+          res,
+          400,
+          "VALIDATION_ERROR",
+          "Invalid milestone data",
+          parsed.error.issues
+        );
       }
 
       const milestone = await Milestone.findById(id);
 
       if (!milestone) {
-        return sendError(res, 404, "MILESTONE_NOT_FOUND", "Milestone not found");
+        return sendError(res, 404, "NOT_FOUND", "Milestone not found");
       }
 
       const project = await Project.findById(milestone.projectId);
 
       if (!project) {
-        return sendError(res, 404, "MILESTONE_NOT_FOUND", "Milestone not found");
+        return sendError(res, 404, "NOT_FOUND", "Milestone not found");
       }
 
       const userId = req.user!._id.toString();
@@ -66,22 +52,27 @@ router.patch(
         project.freelancerId?.toString() === userId;
 
       if (!isParticipant) {
-        return sendError(res, 404, "MILESTONE_NOT_FOUND", "Milestone not found");
+        return sendError(res, 404, "NOT_FOUND", "Milestone not found");
       }
 
       if (req.user!.role !== "client") {
-        return sendError(res, 403, "FORBIDDEN", "Only the client can edit milestones");
+        return sendError(
+          res,
+          403,
+          "FORBIDDEN",
+          "Only the client can edit milestones"
+        );
       }
 
       if (project.clientId.toString() !== userId) {
-        return sendError(res, 404, "MILESTONE_NOT_FOUND", "Milestone not found");
+        return sendError(res, 404, "NOT_FOUND", "Milestone not found");
       }
 
       if (milestone.status !== "draft") {
         return sendError(
           res,
           409,
-          "MILESTONE_NOT_EDITABLE",
+          "INVALID_STATE",
           "Only draft milestones can be edited"
         );
       }
@@ -114,7 +105,7 @@ router.patch(
       return sendError(
         res,
         500,
-        "INTERNAL_SERVER_ERROR",
+        "INTERNAL_ERROR",
         "Could not update milestone"
       );
     }
@@ -122,7 +113,6 @@ router.patch(
 );
 
 // POST /api/milestones/:id/approve-criteria
-// Assigned freelancer approves the milestone criteria
 router.post(
   "/:id/approve-criteria",
   requireAuth,
@@ -137,13 +127,13 @@ router.post(
       const milestone = await Milestone.findById(id);
 
       if (!milestone) {
-        return sendError(res, 404, "MILESTONE_NOT_FOUND", "Milestone not found");
+        return sendError(res, 404, "NOT_FOUND", "Milestone not found");
       }
 
       const project = await Project.findById(milestone.projectId);
 
       if (!project) {
-        return sendError(res, 404, "MILESTONE_NOT_FOUND", "Milestone not found");
+        return sendError(res, 404, "NOT_FOUND", "Milestone not found");
       }
 
       const userId = req.user!._id.toString();
@@ -153,7 +143,7 @@ router.post(
         project.freelancerId?.toString() === userId;
 
       if (!isParticipant) {
-        return sendError(res, 404, "MILESTONE_NOT_FOUND", "Milestone not found");
+        return sendError(res, 404, "NOT_FOUND", "Milestone not found");
       }
 
       if (req.user!.role !== "freelancer") {
@@ -166,14 +156,14 @@ router.post(
       }
 
       if (project.freelancerId?.toString() !== userId) {
-        return sendError(res, 404, "MILESTONE_NOT_FOUND", "Milestone not found");
+        return sendError(res, 404, "NOT_FOUND", "Milestone not found");
       }
 
       if (milestone.status !== "draft") {
         return sendError(
           res,
           409,
-          "INVALID_MILESTONE_STATUS",
+          "INVALID_STATE",
           "Only draft milestones can have criteria approved"
         );
       }
@@ -189,7 +179,7 @@ router.post(
       return sendError(
         res,
         500,
-        "INTERNAL_SERVER_ERROR",
+        "INTERNAL_ERROR",
         "Could not approve milestone criteria"
       );
     }
@@ -204,36 +194,22 @@ router.get(
     try {
       const { id } = req.params;
 
-      // Validate MongoDB ObjectId
       if (!mongoose.isValidObjectId(id)) {
         return sendError(res, 400, "INVALID_ID", "Invalid milestone ID");
       }
 
-      // Find milestone
       const milestone = await Milestone.findById(id);
 
       if (!milestone) {
-        return sendError(
-          res,
-          404,
-          "MILESTONE_NOT_FOUND",
-          "Milestone not found"
-        );
+        return sendError(res, 404, "NOT_FOUND", "Milestone not found");
       }
 
-      // Find associated project
       const project = await Project.findById(milestone.projectId);
 
       if (!project) {
-        return sendError(
-          res,
-          404,
-          "MILESTONE_NOT_FOUND",
-          "Milestone not found"
-        );
+        return sendError(res, 404, "NOT_FOUND", "Milestone not found");
       }
 
-      // Check whether logged-in user is a project participant
       const userId = req.user!._id.toString();
 
       const isParticipant =
@@ -241,21 +217,15 @@ router.get(
         project.freelancerId?.toString() === userId;
 
       if (!isParticipant) {
-        return sendError(
-          res,
-          404,
-          "MILESTONE_NOT_FOUND",
-          "Milestone not found"
-        );
+        return sendError(res, 404, "NOT_FOUND", "Milestone not found");
       }
 
-      // Return milestone
       return res.status(200).json({ milestone });
     } catch {
       return sendError(
         res,
         500,
-        "INTERNAL_SERVER_ERROR",
+        "INTERNAL_ERROR",
         "Could not retrieve milestone"
       );
     }

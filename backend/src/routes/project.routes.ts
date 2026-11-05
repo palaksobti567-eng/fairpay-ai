@@ -1,31 +1,18 @@
-import Milestone from "../models/Milestone";
-import { createMilestoneSchema } from "../validators/milestone.validator";
+
 import { Router, Request, Response } from "express";
 import mongoose from "mongoose";
 import Project from "../models/Project";
 import User from "../models/User";
+import Milestone from "../models/Milestone";
 import { requireAuth, requireRole } from "../middleware/auth.middleware";
+import { sendError } from "../utils/errors";
 import {
   createProjectSchema,
   inviteFreelancerSchema,
 } from "../validators/project.validator";
+import { createMilestoneSchema } from "../validators/milestone.validator";
 
 const router = Router();
-
-function sendError(
-  res: Response,
-  status: number,
-  code: string,
-  message: string
-) {
-  return res.status(status).json({
-    error: {
-      code,
-      message,
-      details: [],
-    },
-  });
-}
 
 // POST /api/projects - Create project (clients only)
 router.post(
@@ -37,13 +24,10 @@ router.post(
       const parsed = createProjectSchema.safeParse(req.body);
 
       if (!parsed.success) {
-        return res.status(400).json({
-          error: {
-            code: "VALIDATION_ERROR",
-            message: "Invalid project data",
-            details: parsed.error.issues,
-          },
-        });
+        return sendError(
+          res, 400, "VALIDATION_ERROR",
+          "Invalid project data", parsed.error.issues
+        );
       }
 
       const project = await Project.create({
@@ -55,10 +39,7 @@ router.post(
       return res.status(201).json({ project });
     } catch {
       return sendError(
-        res,
-        500,
-        "INTERNAL_SERVER_ERROR",
-        "Could not create project"
+        res, 500, "INTERNAL_ERROR", "Could not create project"
       );
     }
   }
@@ -72,17 +53,17 @@ router.get(
     try {
       const userId = req.user!._id;
 
-      const projects = await Project.find({
-        $or: [{ clientId: userId }, { freelancerId: userId }],
-      }).sort({ createdAt: -1 });
+      const filter =
+        req.user!.role === "client"
+          ? { clientId: userId }
+          : { freelancerId: userId };
+
+      const projects = await Project.find(filter).sort({ createdAt: -1 });
 
       return res.status(200).json({ projects });
     } catch {
       return sendError(
-        res,
-        500,
-        "INTERNAL_SERVER_ERROR",
-        "Could not retrieve projects"
+        res, 500, "INTERNAL_ERROR", "Could not retrieve projects"
       );
     }
   }
@@ -103,7 +84,7 @@ router.get(
       const project = await Project.findById(id);
 
       if (!project) {
-        return sendError(res, 404, "PROJECT_NOT_FOUND", "Project not found");
+        return sendError(res, 404, "NOT_FOUND", "Project not found");
       }
 
       const userId = req.user!._id.toString();
@@ -113,22 +94,19 @@ router.get(
         project.freelancerId?.toString() === userId;
 
       if (!isParticipant) {
-        return sendError(res, 404, "PROJECT_NOT_FOUND", "Project not found");
+        return sendError(res, 404, "NOT_FOUND", "Project not found");
       }
 
       return res.status(200).json({ project });
     } catch {
       return sendError(
-        res,
-        500,
-        "INTERNAL_SERVER_ERROR",
-        "Could not retrieve project"
+        res, 500, "INTERNAL_ERROR", "Could not retrieve project"
       );
     }
   }
 );
 
-// POST /api/projects/:id/invite - Invite a freelancer
+// POST /api/projects/:id/invite - Assign a freelancer
 router.post(
   "/:id/invite",
   requireAuth,
@@ -144,28 +122,19 @@ router.post(
       const parsed = inviteFreelancerSchema.safeParse(req.body);
 
       if (!parsed.success) {
-        return res.status(400).json({
-          error: {
-            code: "VALIDATION_ERROR",
-            message: "Invalid invitation data",
-            details: parsed.error.issues,
-          },
-        });
-      }
-
-      const project = await Project.findById(id);
-
-      if (!project || project.clientId.toString() !== req.user!._id.toString()) {
-        return sendError(res, 404, "PROJECT_NOT_FOUND", "Project not found");
-      }
-
-      if (project.freelancerId) {
         return sendError(
-          res,
-          409,
-          "FREELANCER_ALREADY_ASSIGNED",
-          "A freelancer is already assigned to this project"
+          res, 400, "VALIDATION_ERROR",
+          "Invalid invitation data", parsed.error.issues
         );
+      }
+
+      const project = await Project.findOne({
+        _id: id,
+        clientId: req.user!._id,
+      });
+
+      if (!project) {
+        return sendError(res, 404, "NOT_FOUND", "Project not found");
       }
 
       const freelancer = await User.findOne({
@@ -175,31 +144,43 @@ router.post(
 
       if (!freelancer) {
         return sendError(
-          res,
-          404,
-          "FREELANCER_NOT_FOUND",
-          "No freelancer found with this email"
+          res, 404, "NOT_FOUND", "Freelancer not found"
         );
       }
 
-      project.freelancerId = freelancer._id;
-      await project.save();
+      // Assign only if no freelancer has already been assigned.
+      const updatedProject = await Project.findOneAndUpdate(
+        {
+          _id: id,
+          clientId: req.user!._id,
+          freelancerId: null,
+        },
+        {
+          $set: { freelancerId: freelancer._id },
+        },
+        { new: true, runValidators: true }
+      );
+
+      if (!updatedProject) {
+        return sendError(
+          res, 409, "INVALID_STATE",
+          "A freelancer is already assigned to this project"
+        );
+      }
 
       return res.status(200).json({
-        message: "Freelancer invited successfully",
-        project,
+        message: "Freelancer assigned successfully",
+        project: updatedProject,
       });
     } catch {
       return sendError(
-        res,
-        500,
-        "INTERNAL_SERVER_ERROR",
-        "Could not invite freelancer"
+        res, 500, "INTERNAL_ERROR", "Could not invite freelancer"
       );
     }
   }
 );
 
+// POST /api/projects/:id/milestones - Create milestone
 router.post(
   "/:id/milestones",
   requireAuth,
@@ -215,22 +196,19 @@ router.post(
       const parsed = createMilestoneSchema.safeParse(req.body);
 
       if (!parsed.success) {
-        return res.status(400).json({
-          error: {
-            code: "VALIDATION_ERROR",
-            message: "Invalid milestone data",
-            details: parsed.error.issues,
-          },
-        });
+        return sendError(
+          res, 400, "VALIDATION_ERROR",
+          "Invalid milestone data", parsed.error.issues
+        );
       }
 
-      const project = await Project.findById(id);
+      const project = await Project.findOne({
+        _id: id,
+        clientId: req.user!._id,
+      });
 
-      if (
-        !project ||
-        project.clientId.toString() !== req.user!._id.toString()
-      ) {
-        return sendError(res, 404, "PROJECT_NOT_FOUND", "Project not found");
+      if (!project) {
+        return sendError(res, 404, "NOT_FOUND", "Project not found");
       }
 
       const milestone = await Milestone.create({
@@ -248,14 +226,10 @@ router.post(
       return res.status(201).json({ milestone });
     } catch {
       return sendError(
-        res,
-        500,
-        "INTERNAL_SERVER_ERROR",
-        "Could not create milestone"
+        res, 500, "INTERNAL_ERROR", "Could not create milestone"
       );
     }
   }
 );
 
 export default router;
-
