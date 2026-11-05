@@ -1,3 +1,5 @@
+import milestoneRoutes from "./routes/milestone.routes";
+import projectRoutes from "./routes/project.routes";
 import "dotenv/config";
 import dotenv from "dotenv";
 dotenv.config();
@@ -9,6 +11,8 @@ const app = express();
 
 app.use(express.json());
 app.use("/api/auth", authRoutes);
+app.use("/api/projects", projectRoutes);
+app.use("/api/milestones", milestoneRoutes);
 const port = Number(process.env.PORT) || 3000;
 
 app.get("/health", (_req, res) => {
