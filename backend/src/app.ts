@@ -1,10 +1,14 @@
+import "dotenv/config";
 import dotenv from "dotenv";
 dotenv.config();
-
+import authRoutes from "./routes/auth.routes";
 import express from "express";
 import { connectDB } from "./config/db";
 
 const app = express();
+
+app.use(express.json());
+app.use("/api/auth", authRoutes);
 const port = Number(process.env.PORT) || 3000;
 
 app.get("/health", (_req, res) => {
