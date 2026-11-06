@@ -1,4 +1,5 @@
 
+
 import mongoose, { Document, Schema } from "mongoose";
 
 export type MilestoneStatus =
@@ -18,11 +19,17 @@ export interface IMilestone extends Document {
   title: string;
   amount: number;
   currency: string;
+  paymentStatus: "not_started" | "simulated";
+  paymentSimulatedAt?: Date;
+  paymentReference?: string;
   status: MilestoneStatus;
   criteria: {
     id: string;
     text: string;
   }[];
+  submissionDescription?: string;
+  rejectionReason?: string;
+  evidenceLinks: string[];
   createdAt: Date;
 }
 
@@ -34,6 +41,12 @@ const milestoneSchema = new Schema<IMilestone>(
       required: true,
       index: true,
     },
+    rejectionReason: {
+  type: String,
+  trim: true,
+  maxlength: 1000,
+},
+
     title: {
       type: String,
       required: true,
@@ -83,6 +96,34 @@ const milestoneSchema = new Schema<IMilestone>(
         },
       },
     ],
+    paymentStatus: {
+  type: String,
+  enum: ["not_started", "simulated"],
+  default: "not_started",
+  required: true,
+},
+
+paymentSimulatedAt: {
+  type: Date,
+},
+
+paymentReference: {
+  type: String,
+  trim: true,
+},
+    submissionDescription: {
+      type: String,
+      trim: true,
+      maxlength: 3000,
+    },
+    evidenceLinks: {
+      type: [String],
+      default: [],
+      validate: {
+        validator: (links: string[]) => links.length <= 10,
+        message: "Maximum 10 evidence links are allowed",
+      },
+    },
   },
   {
     timestamps: { createdAt: true, updatedAt: false },

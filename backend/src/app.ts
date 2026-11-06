@@ -1,9 +1,11 @@
+import submissionRoutes from "./routes/submission.routes";
 import milestoneRoutes from "./routes/milestone.routes";
 import projectRoutes from "./routes/project.routes";
 import "dotenv/config";
 import dotenv from "dotenv";
 dotenv.config();
 import authRoutes from "./routes/auth.routes";
+import aiRoutes from "./routes/ai.routes";
 import express from "express";
 import { connectDB } from "./config/db";
 
@@ -13,6 +15,8 @@ app.use(express.json());
 app.use("/api/auth", authRoutes);
 app.use("/api/projects", projectRoutes);
 app.use("/api/milestones", milestoneRoutes);
+app.use("/api/ai", aiRoutes);
+app.use("/api/submissions", submissionRoutes);
 const port = Number(process.env.PORT) || 3000;
 
 app.get("/health", (_req, res) => {

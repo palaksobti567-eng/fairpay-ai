@@ -10,11 +10,14 @@ import {
   createProjectSchema,
   inviteFreelancerSchema,
 } from "../validators/project.validator";
-import { createMilestoneSchema } from "../validators/milestone.validator";
+import {
+  createMilestoneSchema,
+  bulkCreateMilestonesSchema,
+} from "../validators/milestone.validator";
 
 const router = Router();
 
-// POST /api/projects - Create project (clients only)
+// POST /api/projects - Create project
 router.post(
   "/",
   requireAuth,
@@ -45,7 +48,7 @@ router.post(
   }
 );
 
-// GET /api/projects - List projects belonging to the user
+// GET /api/projects - List user's projects
 router.get(
   "/",
   requireAuth,
@@ -106,7 +109,7 @@ router.get(
   }
 );
 
-// POST /api/projects/:id/invite - Assign a freelancer
+// POST /api/projects/:id/invite - Assign freelancer
 router.post(
   "/:id/invite",
   requireAuth,
@@ -143,12 +146,9 @@ router.post(
       });
 
       if (!freelancer) {
-        return sendError(
-          res, 404, "NOT_FOUND", "Freelancer not found"
-        );
+        return sendError(res, 404, "NOT_FOUND", "Freelancer not found");
       }
 
-      // Assign only if no freelancer has already been assigned.
       const updatedProject = await Project.findOneAndUpdate(
         {
           _id: id,
@@ -180,7 +180,7 @@ router.post(
   }
 );
 
-// POST /api/projects/:id/milestones - Create milestone
+// POST /api/projects/:id/milestones - Create one milestone
 router.post(
   "/:id/milestones",
   requireAuth,
@@ -211,11 +211,41 @@ router.post(
         return sendError(res, 404, "NOT_FOUND", "Project not found");
       }
 
+      if (
+        !Number.isFinite(project.totalBudget) ||
+        project.totalBudget <= 0
+      ) {
+        return sendError(
+          res, 409, "INVALID_STATE",
+          "Project budget is not configured"
+        );
+      }
+
+      const existingMilestones = await Milestone.find({
+        projectId: project._id,
+      }).select("amount");
+
+      const existingTotalCents = existingMilestones.reduce(
+        (sum, milestone) =>
+          sum + Math.round(milestone.amount * 100),
+        0
+      );
+
+      const newAmountCents = Math.round(parsed.data.amount * 100);
+      const budgetCents = Math.round(project.totalBudget * 100);
+
+      if (existingTotalCents + newAmountCents > budgetCents) {
+        return sendError(
+          res, 409, "INVALID_STATE",
+          "Milestone amount exceeds the remaining project budget"
+        );
+      }
+
       const milestone = await Milestone.create({
         projectId: project._id,
         title: parsed.data.title,
         amount: parsed.data.amount,
-        currency: parsed.data.currency.toUpperCase(),
+        currency: project.currency,
         criteria: parsed.data.criteria.map((criterion) => ({
           id: new mongoose.Types.ObjectId().toString(),
           text: criterion.text,
@@ -227,6 +257,95 @@ router.post(
     } catch {
       return sendError(
         res, 500, "INTERNAL_ERROR", "Could not create milestone"
+      );
+    }
+  }
+);
+
+// POST /api/projects/:id/milestones/bulk - Save multiple milestones
+router.post(
+  "/:id/milestones/bulk",
+  requireAuth,
+  requireRole("client"),
+  async (req: Request, res: Response) => {
+    try {
+      const { id } = req.params;
+
+      if (!mongoose.isValidObjectId(id)) {
+        return sendError(res, 400, "INVALID_ID", "Invalid project ID");
+      }
+
+      const parsed = bulkCreateMilestonesSchema.safeParse(req.body);
+
+      if (!parsed.success) {
+        return sendError(
+          res, 400, "VALIDATION_ERROR",
+          "Invalid milestone data", parsed.error.issues
+        );
+      }
+
+      const project = await Project.findOne({
+        _id: id,
+        clientId: req.user!._id,
+      });
+
+      if (!project) {
+        return sendError(res, 404, "NOT_FOUND", "Project not found");
+      }
+
+      if (
+        !Number.isFinite(project.totalBudget) ||
+        project.totalBudget <= 0
+      ) {
+        return sendError(
+          res, 409, "INVALID_STATE",
+          "Project budget is not configured"
+        );
+      }
+
+      const existingMilestones = await Milestone.find({
+        projectId: project._id,
+      }).select("amount");
+
+      const existingTotalCents = existingMilestones.reduce(
+        (sum, milestone) =>
+          sum + Math.round(milestone.amount * 100),
+        0
+      );
+
+      const newTotalCents = parsed.data.milestones.reduce(
+        (sum, milestone) =>
+          sum + Math.round(milestone.amount * 100),
+        0
+      );
+
+      const budgetCents = Math.round(project.totalBudget * 100);
+
+      if (existingTotalCents + newTotalCents > budgetCents) {
+        return sendError(
+          res, 409, "INVALID_STATE",
+          "Milestone amounts exceed the remaining project budget"
+        );
+      }
+
+      const milestones = await Milestone.insertMany(
+        parsed.data.milestones.map((milestone) => ({
+          projectId: project._id,
+          title: milestone.title,
+          amount: milestone.amount,
+          currency: project.currency,
+          criteria: milestone.criteria.map((criterion) => ({
+            id: new mongoose.Types.ObjectId().toString(),
+            text: criterion.text,
+          })),
+          status: "draft",
+        }))
+      );
+
+      return res.status(201).json({ milestones });
+    } catch {
+      return sendError(
+        res, 500, "INTERNAL_ERROR", "Could not save milestones"
       );
     }
   }
