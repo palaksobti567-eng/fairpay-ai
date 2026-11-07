@@ -5,13 +5,20 @@ import mongoose from "mongoose";
 import Submission from "../models/Submission";
 import Milestone from "../models/Milestone";
 import Project from "../models/Project";
+import Screenshot from "../models/Screenshot";
 import VerificationReport from "../models/VerificationReport";
 
 import { requireAuth } from "../middleware/auth.middleware";
 import { sendError } from "../utils/errors";
 import {
-  verifySubmission,
+  inspectWebsite,
+  type InspectionObservations,
+} from "../services/inspector";
+import { saveInspectionScreenshots } from "../services/screenshotStorage";
+import {
   AiVerificationError,
+  parseInspectionObservations,
+  verifyBrowserEvidence,
 } from "../services/verifier";
 
 const router = Router();
@@ -35,8 +42,98 @@ function isProjectParticipant(
   );
 }
 
+function hasUsableScreenshotBuffer(value: unknown): boolean {
+  return Buffer.isBuffer(value) && value.length > 0;
+}
+
+type BrowserEvidence = {
+  observations: InspectionObservations;
+  hasDesktopScreenshot: boolean;
+  hasMobileScreenshot: boolean;
+};
+
+async function loadStoredBrowserEvidence(
+  submissionId: mongoose.Types.ObjectId
+): Promise<BrowserEvidence | null> {
+  const screenshot = await Screenshot.findOne({
+    submissionId,
+  }).select("+desktop +mobile");
+
+  if (!screenshot) {
+    return null;
+  }
+
+  const observations = parseInspectionObservations(screenshot.observations);
+
+  if (!observations) {
+    return null;
+  }
+
+  const hasDesktopScreenshot = hasUsableScreenshotBuffer(screenshot.desktop);
+  const hasMobileScreenshot = hasUsableScreenshotBuffer(screenshot.mobile);
+
+  if (!hasDesktopScreenshot || !hasMobileScreenshot) {
+    return null;
+  }
+
+  return {
+    observations,
+    hasDesktopScreenshot,
+    hasMobileScreenshot,
+  };
+}
+
+async function collectBrowserEvidenceFromPreview(
+  submissionId: mongoose.Types.ObjectId,
+  projectId: mongoose.Types.ObjectId,
+  previewUrl: string
+): Promise<{
+  evidence: BrowserEvidence | null;
+  unsafeUrl: boolean;
+}> {
+  const inspection = await inspectWebsite(previewUrl);
+
+  if (inspection.errorCode === "UNSAFE_URL") {
+    return { evidence: null, unsafeUrl: true };
+  }
+
+  if (
+    inspection.status !== "success" ||
+    !inspection.observations ||
+    !inspection.screenshots.desktop ||
+    !inspection.screenshots.mobile
+  ) {
+    return { evidence: null, unsafeUrl: false };
+  }
+
+  try {
+    await saveInspectionScreenshots({
+      submissionId: submissionId.toString(),
+      projectId: projectId.toString(),
+      desktop: inspection.screenshots.desktop,
+      mobile: inspection.screenshots.mobile,
+      observations: inspection.observations,
+    });
+  } catch (error) {
+    console.error(
+      "Verification screenshot save error:",
+      error instanceof Error ? error.name : "unknown error"
+    );
+    return { evidence: null, unsafeUrl: false };
+  }
+
+  return {
+    evidence: {
+      observations: inspection.observations,
+      hasDesktopScreenshot: true,
+      hasMobileScreenshot: true,
+    },
+    unsafeUrl: false,
+  };
+}
+
 // POST /api/submissions/:id/verify
-// Client starts AI verification of a submission
+// Client starts browser verification of a submission
 router.post(
   "/:id/verify",
   async (req: Request, res: Response) => {
@@ -87,7 +184,6 @@ router.post(
         return sendError(res, 404, "NOT_FOUND", "Submission not found");
       }
 
-      // A running report must never be started twice.
       const existingReport = await VerificationReport.findOne({
         submissionId: submission._id,
       });
@@ -110,18 +206,61 @@ router.post(
         );
       }
 
-      // Reserve the report. Reuse a previous failed/completed report.
+      let evidence = await loadStoredBrowserEvidence(submission._id);
+
+      if (!evidence && submission.previewUrl) {
+        const collected = await collectBrowserEvidenceFromPreview(
+          submission._id,
+          project._id,
+          submission.previewUrl
+        );
+
+        if (collected.unsafeUrl) {
+          return sendError(
+            res,
+            400,
+            "UNSAFE_URL",
+            "The preview URL could not be inspected safely"
+          );
+        }
+
+        evidence = collected.evidence;
+      }
+
+      if (!evidence) {
+        return sendError(
+          res,
+          409,
+          "BROWSER_EVIDENCE_REQUIRED",
+          "Independent browser evidence is required to verify this submission"
+        );
+      }
+
+      const result = verifyBrowserEvidence({
+        criteria: milestone.criteria.map((criterion) => ({
+          id: criterion.id,
+          text: criterion.text,
+        })),
+        observations: evidence.observations,
+        hasDesktopScreenshot: evidence.hasDesktopScreenshot,
+        hasMobileScreenshot: evidence.hasMobileScreenshot,
+      });
+
       const reportData = {
         submissionId: submission._id,
         milestoneId: milestone._id,
         projectId: project._id,
         freelancerId: submission.freelancerId,
-        source: submission.source,
+        source: "browser" as const,
         criteriaSnapshot: milestone.criteria.map((criterion) => ({
           id: criterion.id,
           text: criterion.text,
         })),
-        criteriaResults: [],
+        criteriaResults: [] as {
+          criterionId: string;
+          status: "completed" | "missing" | "unverified";
+          reason: string;
+        }[],
         summary: "Verification is in progress.",
         status: "running" as const,
       };
@@ -150,7 +289,6 @@ router.post(
         try {
           report = await VerificationReport.create(reportData);
         } catch (error) {
-          // Another request may have reserved this submission first.
           if (
             error &&
             typeof error === "object" &&
@@ -172,7 +310,6 @@ router.post(
       reportId = report._id;
       milestoneId = milestone._id;
 
-      // Atomically move submitted -> verifying.
       const updatedMilestone = await Milestone.findOneAndUpdate(
         {
           _id: milestone._id,
@@ -203,42 +340,21 @@ router.post(
         );
       }
 
-      // Run the text-only verifier.
-      const result = await verifySubmission({
-        criteria: milestone.criteria.map((criterion) => ({
-          id: criterion.id,
-          text: criterion.text,
-        })),
-        description: submission.description,
-      });
-
       report.criteriaResults = result.criteriaResults;
       report.summary = result.summary;
+      report.source = "browser";
       report.status = "completed";
 
       await report.save();
 
-      // Text-only evidence cannot promote a milestone to verified.
-     const restoredMilestone = await Milestone.updateOne(
-  { _id: milestone._id, status: "verifying" },
-  { $set: { status: "submitted" } }
-);
-
-if (restoredMilestone.modifiedCount !== 1) {
-  throw new Error(
-    "Milestone state changed before verification could finish"
-  );
-}
-
-reportId = undefined;
-milestoneId = undefined;
+      reportId = undefined;
+      milestoneId = undefined;
 
       return res.status(200).json({
         message: "Verification completed successfully",
         report,
       });
     } catch (error) {
-      // Restore the milestone so verification can be retried.
       if (milestoneId) {
         await Milestone.updateOne(
           { _id: milestoneId, status: "verifying" },

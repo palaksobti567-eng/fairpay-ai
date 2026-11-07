@@ -117,7 +117,9 @@ router.post("/login", async (req, res) => {
         role: user.role,
       },
     });
-  } catch {
+  } catch (error) {
+    console.error("LOGIN ERROR:", error);
+
     return sendError(
       res,
       500,

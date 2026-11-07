@@ -1,5 +1,5 @@
 
-import dns from "node:dns";
+
 import mongoose from "mongoose";
 
 export async function connectDB(): Promise<void> {
@@ -11,8 +11,7 @@ export async function connectDB(): Promise<void> {
   }
 
   try {
-    dns.setServers(["8.8.8.8", "8.8.4.4"]);
-
+    
     await mongoose.connect(mongoUri, {
       serverSelectionTimeoutMS: 10000,
     });
