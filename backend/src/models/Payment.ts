@@ -13,6 +13,7 @@ export interface IPayment extends Document {
   captureId?: string;
   requestId: string;
   captureRequestId?: string;
+  captureStartedAt?: Date;
   status: PaymentStatus;
   amount: number;
   currency: string;
@@ -49,7 +50,10 @@ const paymentSchema = new Schema<IPayment>(
     captureRequestId: {
       type: String,
       trim: true,
-    },
+   },
+   captureStartedAt: {
+      type: Date,
+},
     status: {
       type: String,
       enum: ["created", "capturing", "completed", "failed"],

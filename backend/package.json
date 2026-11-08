@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "tsx watch src/app.ts",
+    "start": "node dist/app.js",
     "build": "tsc",
     "test:gemini": "tsx scripts/gemini-test.ts",
     "test:kernel": "tsx scripts/kernel-test.ts",
@@ -26,6 +27,6 @@
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^26.6.6",
     "tsx": "^4.23.15",
-    "typescript": "^7.0.2"
+    "typescript": "^5.9.3"
   }
 }

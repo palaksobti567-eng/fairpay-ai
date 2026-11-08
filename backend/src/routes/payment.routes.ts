@@ -1,4 +1,3 @@
-
 import { Router, Request, Response } from "express";
 import mongoose from "mongoose";
 import { randomUUID } from "crypto";
@@ -15,9 +14,19 @@ import {
   createPayPalOrder,
   getPayPalOrder,
   capturePayPalOrder,
-} from "../services/paypal";const router = Router();
+} from "../services/paypal";
+
+const router = Router();
 
 router.use(requireAuth);
+
+// A capture attempt older than this is treated as interrupted.
+// It may then be retried, but only with the SAME PayPal idempotency key.
+const CAPTURE_LOCK_TIMEOUT_MS = 2 * 60 * 1000;
+
+// Capture statuses that mean PayPal definitively refused the money.
+// (PayPal documents DECLINED for captures; DENIED is accepted as well.)
+const DEFINITIVE_FAILURE_STATUSES = ["DENIED", "DECLINED"];
 
 const createOrderSchema = z.object({
   milestoneId: z.string().refine(
@@ -231,16 +240,188 @@ router.post("/create-order", async (req: Request, res: Response) => {
     );
   }
 });
-function amountsMatch(
-  actualValue: string | undefined,
-  expectedAmount: number
-): boolean {
-  if (!actualValue || !/^\d+(\.\d{1,2})?$/.test(actualValue)) {
-    return false;
+
+// ---------------------------------------------------------------------------
+// Helpers for capture-order
+// ---------------------------------------------------------------------------
+
+// Convert a money value to whole cents WITHOUT floating-point equality.
+// Strings come from PayPal ("19.99"); numbers come from MongoDB (19.99).
+// Returns null for anything that is not a valid amount with at most 2 decimals.
+function toCents(value: string | number | null | undefined): number | null {
+  if (typeof value === "string") {
+    if (!/^\d+(\.\d{1,2})?$/.test(value)) {
+      return null;
+    }
+
+    const [whole, fraction = ""] = value.split(".");
+    return Number(whole) * 100 + Number(fraction.padEnd(2, "0"));
   }
 
-  return Math.round(Number(actualValue) * 100) ===
-    Math.round(expectedAmount * 100);
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || value < 0) {
+      return null;
+    }
+
+    const cents = Math.round(value * 100);
+    return Math.abs(value * 100 - cents) < 1e-6 ? cents : null;
+  }
+
+  return null;
+}
+
+function amountsMatch(
+  actual: string | number | null | undefined,
+  expected: string | number | null | undefined
+): boolean {
+  const actualCents = toCents(actual);
+  const expectedCents = toCents(expected);
+
+  return (
+    actualCents !== null &&
+    expectedCents !== null &&
+    actualCents === expectedCents
+  );
+}
+
+function sameCurrency(
+  a: string | null | undefined,
+  b: string | null | undefined
+): boolean {
+  return !!a && !!b && a.toUpperCase() === b.toUpperCase();
+}
+
+type MoneyLike =
+  | { currency_code?: string | null; value?: string | null }
+  | null
+  | undefined;
+
+type CaptureLike =
+  | {
+      id?: string | null;
+      status?: string | null;
+      amount?: MoneyLike;
+    }
+  | null
+  | undefined;
+
+function moneyMatches(
+  money: MoneyLike,
+  expectedAmount: number,
+  expectedCurrency: string
+): boolean {
+  return (
+    !!money &&
+    sameCurrency(money.currency_code, expectedCurrency) &&
+    amountsMatch(money.value, expectedAmount)
+  );
+}
+
+// Returns the capture ID only if the capture is COMPLETED, has an ID,
+// and its amount and currency match the stored Payment.
+function verifiedCaptureId(
+  capture: CaptureLike,
+  payment: { amount: number; currency: string }
+): string | null {
+  if (!capture || capture.status !== "COMPLETED" || !capture.id) {
+    return null;
+  }
+
+  if (!moneyMatches(capture.amount, payment.amount, payment.currency)) {
+    return null;
+  }
+
+  return capture.id;
+}
+
+// Atomically move a payment to completed. Only created/capturing payments
+// can be completed, and a completed payment is never changed again.
+// Returns the completed payment, or null if it could not be completed.
+async function completePayment(
+  paymentId: mongoose.Types.ObjectId,
+  captureId: string
+) {
+  const updated = await Payment.findOneAndUpdate(
+    { _id: paymentId, status: { $in: ["created", "capturing"] } },
+    {
+      $set: {
+        status: "completed",
+        captureId,
+        paidAt: new Date(),
+      },
+    },
+    { new: true, runValidators: true }
+  );
+
+  if (updated) {
+    return updated;
+  }
+
+  // Another request may have completed it first. That is fine.
+  const latest = await Payment.findById(paymentId);
+  return latest?.status === "completed" ? latest : null;
+}
+
+type CompletedPayment = NonNullable<
+  Awaited<ReturnType<typeof completePayment>>
+>;
+
+// Money has been captured, so the milestone must end up "paid".
+// A failure here is logged and reported, never hidden. The Payment is already
+// "completed", so a later capture-order call repairs the milestone without
+// contacting PayPal.
+async function markMilestonePaid(
+  milestoneId: mongoose.Types.ObjectId
+): Promise<boolean> {
+  try {
+    const result = await Milestone.updateOne(
+      { _id: milestoneId },
+      { $set: { status: "paid" } }
+    );
+
+    return result.acknowledged;
+  } catch (error) {
+    console.error(
+      "Mark milestone paid error:",
+      error instanceof Error ? error.name : "unknown error"
+    );
+
+    return false;
+  }
+}
+
+async function respondPaymentCompleted(
+  res: Response,
+  payment: CompletedPayment,
+  milestoneId: mongoose.Types.ObjectId,
+  message: string
+) {
+  const milestoneUpdated = await markMilestonePaid(milestoneId);
+
+  const paymentBody = {
+    id: payment._id,
+    orderId: payment.orderId,
+    captureId: payment.captureId,
+    status: payment.status,
+    amount: payment.amount,
+    currency: payment.currency,
+    paidAt: payment.paidAt,
+  };
+
+  if (!milestoneUpdated) {
+    return res.status(202).json({
+      message:
+        "Payment was captured, but the milestone update is still pending. Retry this request to finish it.",
+      payment: paymentBody,
+      milestoneStatus: "update_pending",
+    });
+  }
+
+  return res.status(200).json({
+    message,
+    payment: paymentBody,
+    milestoneStatus: "paid",
+  });
 }
 
 router.post("/capture-order", async (req: Request, res: Response) => {
@@ -270,6 +451,7 @@ router.post("/capture-order", async (req: Request, res: Response) => {
       );
     }
 
+    // The order ID only locates the Payment. All amounts come from the database.
     const payment = await Payment.findOne({
       orderId: parsed.data.orderId,
     });
@@ -286,23 +468,13 @@ router.post("/capture-order", async (req: Request, res: Response) => {
     const milestone = await Milestone.findById(payment.milestoneId);
 
     if (!milestone) {
-      return sendError(
-        res,
-        404,
-        "NOT_FOUND",
-        "Milestone not found"
-      );
+      return sendError(res, 404, "NOT_FOUND", "Milestone not found");
     }
 
     const project = await Project.findById(milestone.projectId);
 
     if (!project) {
-      return sendError(
-        res,
-        404,
-        "NOT_FOUND",
-        "Project not found"
-      );
+      return sendError(res, 404, "NOT_FOUND", "Project not found");
     }
 
     if (project.clientId.toString() !== req.user!._id.toString()) {
@@ -311,6 +483,21 @@ router.post("/capture-order", async (req: Request, res: Response) => {
         403,
         "FORBIDDEN",
         "Only the project owner can capture this payment"
+      );
+    }
+
+    // A completed payment is never captured again and never downgraded.
+    // Repair the milestone first if an earlier database update failed.
+    if (payment.status === "completed") {
+      if (milestone.status !== "paid") {
+        await markMilestonePaid(milestone._id);
+      }
+
+      return sendError(
+        res,
+        409,
+        "ALREADY_PAID",
+        "This milestone has already been paid"
       );
     }
 
@@ -328,21 +515,21 @@ router.post("/capture-order", async (req: Request, res: Response) => {
         res,
         409,
         "PAYMENT_FAILED",
-        "This payment failed. Create a new payment order to retry."
+        "This payment previously failed and cannot be captured"
       );
     }
 
-    // Fetch the actual order from PayPal before capturing or reconciling.
     if (!payment.orderId) {
-  return sendError(
-    res,
-    409,
-    "ORDER_ID_MISSING",
-    "Payment does not have a PayPal order ID"
-  );
-}
+      return sendError(
+        res,
+        409,
+        "ORDER_ID_MISSING",
+        "Payment does not have a PayPal order ID"
+      );
+    }
 
-const paypalOrder = await getPayPalOrder(payment.orderId);
+    // Ask PayPal for the real order state before capturing or reconciling.
+    const paypalOrder = await getPayPalOrder(payment.orderId);
 
     if (paypalOrder.id !== payment.orderId) {
       return sendError(
@@ -353,15 +540,16 @@ const paypalOrder = await getPayPalOrder(payment.orderId);
       );
     }
 
-    const purchaseUnit = paypalOrder.purchase_units?.[0];
-    const orderAmount = purchaseUnit?.amount;
+    // Payment must still match the milestone, and PayPal must match the Payment.
+    const paymentMatchesMilestone =
+      amountsMatch(payment.amount, milestone.amount) &&
+      sameCurrency(payment.currency, milestone.currency);
+
+    const orderAmount = paypalOrder.purchase_units?.[0]?.amount;
 
     if (
-      !orderAmount ||
-      orderAmount.currency_code.toUpperCase() !== payment.currency.toUpperCase() ||
-      !amountsMatch(orderAmount.value, payment.amount) ||
-      payment.amount !== milestone.amount ||
-      payment.currency.toUpperCase() !== milestone.currency.toUpperCase()
+      !paymentMatchesMilestone ||
+      !moneyMatches(orderAmount, payment.amount, payment.currency)
     ) {
       return sendError(
         res,
@@ -371,112 +559,262 @@ const paypalOrder = await getPayPalOrder(payment.orderId);
       );
     }
 
-    let captureResult = paypalOrder;
+    // If PayPal already completed the order, reconcile locally.
+    // Never issue another capture request.
+    if (paypalOrder.status === "COMPLETED") {
+      const existingCapture =
+        paypalOrder.purchase_units?.[0]?.payments?.captures?.[0];
 
-    // If PayPal already completed the order, reconcile it locally.
-    // Do not attempt another capture.
-    if (paypalOrder.status !== "COMPLETED") {
-      if (paypalOrder.status !== "APPROVED") {
-        return sendError(
-          res,
-          409,
-          "ORDER_NOT_APPROVED",
-          "The PayPal order has not been approved by the payer"
-        );
+      if (existingCapture?.status === "PENDING") {
+        return res.status(202).json({
+          message: "PayPal is still processing this payment",
+          payment: {
+            id: payment._id,
+            orderId: payment.orderId,
+            status: payment.status,
+          },
+        });
       }
 
-            // Local and PayPal statuses disagree. Do not claim success
-      // or attempt another capture until this is reconciled.
-      if (payment.status === "completed") {
-        return sendError(
-          res,
-          503,
-          "PAYMENT_STATUS_MISMATCH",
-          "Local payment is completed but PayPal does not confirm completion"
-        );
-      }
+      const existingCaptureId = verifiedCaptureId(existingCapture, payment);
 
-      // Save a stable capture idempotency key before contacting PayPal.
-      if (!payment.captureRequestId) {
-        payment.captureRequestId = randomUUID();
-      }
-
-      payment.status = "capturing";
-      await payment.save();
-
-      // Reuse the same key if this request needs to be retried.
-      captureResult = await capturePayPalOrder(
-        payment.orderId,
-        payment.captureRequestId
-      );
-    }
-
-    const capture = captureResult.purchase_units?.[0]?.payments?.captures?.[0];
-
-    if (captureResult.status === "COMPLETED") {
-      if (
-        !capture ||
-        capture.status !== "COMPLETED" ||
-        !capture.id ||
-        capture.amount.currency_code.toUpperCase() !== payment.currency.toUpperCase() ||
-        !amountsMatch(capture.amount.value, payment.amount)
-      ) {
-        // Keep the payment in capturing state. Do not claim it is paid
-        // until the capture can be reconciled correctly.
+      if (!existingCaptureId) {
         return sendError(
           res,
           409,
           "CAPTURE_VERIFICATION_FAILED",
-          "PayPal completed the order, but the capture details could not be verified"
+          "PayPal completion could not be verified"
         );
       }
 
-      payment.captureId = capture.id;
-      payment.status = "completed";
-      payment.paidAt = new Date();
-      await payment.save();
-
-      await Milestone.updateOne(
-        { _id: milestone._id },
-        { $set: { status: "paid" } }
+      const reconciled = await completePayment(
+        payment._id,
+        existingCaptureId
       );
 
-      return res.status(200).json({
-        message: "Payment captured successfully",
-        payment: {
-          id: payment._id,
-          orderId: payment.orderId,
-          captureId: payment.captureId,
-          status: payment.status,
-          amount: payment.amount,
-          currency: payment.currency,
-          paidAt: payment.paidAt,
-        },
-        milestoneStatus: "paid",
-      });
+      if (!reconciled) {
+        return sendError(
+          res,
+          503,
+          "PAYMENT_STATUS_UNCONFIRMED",
+          "Payment status is not yet confirmed. Retry using the same order ID."
+        );
+      }
+
+      return respondPaymentCompleted(
+        res,
+        reconciled,
+        milestone._id,
+        "Payment successfully reconciled"
+      );
     }
 
-    // A pending capture is not a successful payment.
-    if (capture?.status === "PENDING" || captureResult.status === "PENDING") {
+    if (paypalOrder.status !== "APPROVED") {
+      return sendError(
+        res,
+        409,
+        "ORDER_NOT_APPROVED",
+        "The PayPal order has not been approved by the payer"
+      );
+    }
+
+    // ATOMIC CLAIM
+    // Exactly one request can win each claim. Only the winner calls PayPal.
+    const now = new Date();
+    const staleBefore = new Date(now.getTime() - CAPTURE_LOCK_TIMEOUT_MS);
+
+    // A lock is stale if it started long ago, or has no start time (old data).
+    const lockIsStale = {
+      $or: [
+        { captureStartedAt: { $lte: staleBefore } },
+        { captureStartedAt: { $exists: false } },
+        { captureStartedAt: null },
+      ],
+    };
+
+    let claimedPayment: typeof payment | null = null;
+
+    if (payment.status === "created") {
+      // First attempt: created -> capturing, and create the idempotency key.
+      claimedPayment = await Payment.findOneAndUpdate(
+        { _id: payment._id, status: "created" },
+        {
+          $set: {
+            status: "capturing",
+            captureRequestId: payment.captureRequestId ?? randomUUID(),
+            captureStartedAt: now,
+          },
+        },
+        { new: true, runValidators: true }
+      );
+    } else if (payment.status === "capturing") {
+      if (payment.captureRequestId) {
+        // Interrupted attempt: take over the lock only if it is stale.
+        // The idempotency key is NOT changed.
+        claimedPayment = await Payment.findOneAndUpdate(
+          {
+            _id: payment._id,
+            status: "capturing",
+            captureRequestId: payment.captureRequestId,
+            ...lockIsStale,
+          },
+          { $set: { captureStartedAt: now } },
+          { new: true }
+        );
+      } else {
+        // Legacy record that never stored a key. The order was just confirmed
+        // as APPROVED (not captured), so a first key is created here.
+        claimedPayment = await Payment.findOneAndUpdate(
+          {
+            _id: payment._id,
+            status: "capturing",
+            $and: [
+              lockIsStale,
+              {
+                $or: [
+                  { captureRequestId: { $exists: false } },
+                  { captureRequestId: null },
+                ],
+              },
+            ],
+          },
+          {
+            $set: {
+              captureStartedAt: now,
+              captureRequestId: randomUUID(),
+            },
+          },
+          { new: true, runValidators: true }
+        );
+      }
+    }
+
+    // null means another request owns the lock, or the state just changed.
+    if (!claimedPayment) {
+      const latestPayment = await Payment.findById(payment._id);
+
+      if (latestPayment?.status === "completed") {
+        await markMilestonePaid(milestone._id);
+
+        return sendError(
+          res,
+          409,
+          "ALREADY_PAID",
+          "This milestone has already been paid"
+        );
+      }
+
+      return sendError(
+        res,
+        409,
+        "PAYMENT_IN_PROGRESS",
+        "Another request is processing this payment. Please retry later."
+      );
+    }
+
+    if (!claimedPayment.orderId || !claimedPayment.captureRequestId) {
+      return sendError(
+        res,
+        409,
+        "PAYMENT_DATA_INVALID",
+        "Payment capture information is incomplete"
+      );
+    }
+
+    // Only the request that won the atomic claim reaches this line.
+    const captureResult = await capturePayPalOrder(
+      claimedPayment.orderId,
+      claimedPayment.captureRequestId
+    );
+
+    if (captureResult.id !== claimedPayment.orderId) {
+      // Ambiguous: leave the payment in "capturing" for later reconciliation.
+      return sendError(
+        res,
+        409,
+        "ORDER_MISMATCH",
+        "PayPal returned a different order"
+      );
+    }
+
+    const capture =
+      captureResult.purchase_units?.[0]?.payments?.captures?.[0];
+
+    if (captureResult.status === "COMPLETED") {
+      if (capture?.status === "PENDING") {
+        return res.status(202).json({
+          message: "PayPal is still processing this payment",
+          payment: {
+            id: claimedPayment._id,
+            orderId: claimedPayment.orderId,
+            status: claimedPayment.status,
+          },
+        });
+      }
+
+      const captureId = verifiedCaptureId(capture, claimedPayment);
+
+      if (!captureId) {
+        // Not marked paid and not marked failed. Stays "capturing".
+        return sendError(
+          res,
+          409,
+          "CAPTURE_VERIFICATION_FAILED",
+          "PayPal completed the order, but capture details could not be verified"
+        );
+      }
+
+      const completed = await completePayment(
+        claimedPayment._id,
+        captureId
+      );
+
+      if (!completed) {
+        // Stays "capturing"; stale-lock recovery will reconcile with PayPal.
+        return sendError(
+          res,
+          503,
+          "PAYMENT_STATUS_UNCONFIRMED",
+          "Payment status is not yet confirmed. Retry using the same order ID."
+        );
+      }
+
+      return respondPaymentCompleted(
+        res,
+        completed,
+        milestone._id,
+        "Payment captured successfully"
+      );
+    }
+
+    if (
+      capture?.status === "PENDING" ||
+      captureResult.status === "PENDING"
+    ) {
       return res.status(202).json({
         message: "PayPal is still processing this payment",
         payment: {
-          id: payment._id,
-          orderId: payment.orderId,
-          status: payment.status,
+          id: claimedPayment._id,
+          orderId: claimedPayment.orderId,
+          status: claimedPayment.status,
         },
       });
     }
 
-    // A definitive denial is recorded as a failure.
-    if (capture?.status === "DENIED") {
-      payment.status = "failed";
-      await payment.save();
-
-      await Milestone.updateOne(
-        { _id: milestone._id },
-        { $set: { status: "payment_failed" } }
+    if (DEFINITIVE_FAILURE_STATUSES.includes(String(capture?.status))) {
+      // Only a payment still in "capturing" can be marked failed.
+      const failedPayment = await Payment.findOneAndUpdate(
+        { _id: claimedPayment._id, status: "capturing" },
+        { $set: { status: "failed" } },
+        { new: true }
       );
+
+      if (failedPayment) {
+        await Milestone.updateOne(
+          { _id: milestone._id, status: "approved" },
+          { $set: { status: "payment_failed" } }
+        );
+      }
 
       return sendError(
         res,
@@ -486,13 +824,12 @@ const paypalOrder = await getPayPalOrder(payment.orderId);
       );
     }
 
-    // Unknown or incomplete response: leave it as capturing.
-    // A later retry will check PayPal's order status first.
+    // Unknown response: keep "capturing". A later retry reconciles with PayPal first.
     return sendError(
       res,
       503,
       "PAYMENT_STATUS_UNCONFIRMED",
-      "Payment status is not yet confirmed. Retry this same order to reconcile it."
+      "Payment status is not yet confirmed. Retry using the same order ID."
     );
   } catch (error) {
     console.error(

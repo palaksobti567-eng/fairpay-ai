@@ -197,7 +197,10 @@ router.post(
         );
       }
 
-      if (milestone.status !== "submitted") {
+      if (
+       milestone.status !== "submitted" &&
+       milestone.status !== "verifying"
+     ) {
         return sendError(
           res,
           409,
@@ -311,10 +314,10 @@ router.post(
       milestoneId = milestone._id;
 
       const updatedMilestone = await Milestone.findOneAndUpdate(
-        {
-          _id: milestone._id,
-          status: "submitted",
-        },
+  {
+    _id: milestone._id,
+    status: { $in: ["submitted", "verifying"] },
+  },
         { $set: { status: "verifying" } },
         { new: true }
       );
