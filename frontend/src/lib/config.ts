@@ -15,9 +15,12 @@ export function setDataMode(mode: DataMode) {
 }
 
 export function apiBaseUrl() {
-  return (import.meta.env.VITE_API_BASE_URL || 'http://localhost:3000').replace(/\/$/, '')
-}
+  const env = import.meta.env as ImportMetaEnv & {
+    API_BASE_URL?: string
+  }
 
+  return (env.API_BASE_URL || 'http://localhost:3000').replace(/\/$/, '')
+}
 export function paypalClientId() {
   return import.meta.env.VITE_PAYPAL_CLIENT_ID || ''
 }
