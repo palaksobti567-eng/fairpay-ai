@@ -4,7 +4,10 @@ import milestoneRoutes from "./routes/milestone.routes";
 import projectRoutes from "./routes/project.routes";
 import "dotenv/config";
 import dotenv from "dotenv";
+// .env wins; .env.example fills anything missing so the committed
+// template doubles as the working env file.
 dotenv.config();
+dotenv.config({ path: ".env.example" });
 import authRoutes from "./routes/auth.routes";
 import aiRoutes from "./routes/ai.routes";
 import express from "express";
