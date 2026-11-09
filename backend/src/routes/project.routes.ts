@@ -9,13 +9,49 @@ import { sendError } from "../utils/errors";
 import {
   createProjectSchema,
   inviteFreelancerSchema,
+  updateProjectSchema,
 } from "../validators/project.validator";
+import Payment from "../models/Payment";
+import { recordAudit } from "../utils/audit";
 import {
   createMilestoneSchema,
   bulkCreateMilestonesSchema,
 } from "../validators/milestone.validator";
 
 const router = Router();
+
+async function projectWithMilestones(project: mongoose.Document) {
+  const milestones = await Milestone.find({ projectId: project._id }).sort({
+    createdAt: 1,
+  });
+
+  return {
+    ...project.toObject(),
+    milestones: milestones.map((milestone) => milestone.toObject()),
+  };
+}
+
+async function projectsWithMilestones(projects: mongoose.Document[]) {
+  const milestones = await Milestone.find({
+    projectId: { $in: projects.map((project) => project._id) },
+  }).sort({ createdAt: 1 });
+
+  const byProject = new Map<string, mongoose.Document[]>();
+
+  for (const milestone of milestones) {
+    const key = milestone.projectId.toString();
+    const current = byProject.get(key) ?? [];
+    current.push(milestone);
+    byProject.set(key, current);
+  }
+
+  return projects.map((project) => ({
+    ...project.toObject(),
+    milestones: (byProject.get(project._id.toString()) ?? []).map(
+      (milestone) => milestone.toObject()
+    ),
+  }));
+}
 
 // POST /api/projects - Create project
 router.post(
@@ -39,7 +75,16 @@ router.post(
         clientId: req.user!._id,
       });
 
-      return res.status(201).json({ project });
+      recordAudit({
+        actorId: req.user!._id,
+        projectId: project._id,
+        eventType: "project.created",
+        eventData: { title: project.title },
+      });
+
+      return res.status(201).json({
+        project: { ...project.toObject(), milestones: [] },
+      });
     } catch {
       return sendError(
         res, 500, "INTERNAL_ERROR", "Could not create project"
@@ -62,8 +107,9 @@ router.get(
           : { freelancerId: userId };
 
       const projects = await Project.find(filter).sort({ createdAt: -1 });
+      const serialized = await projectsWithMilestones(projects);
 
-      return res.status(200).json({ projects });
+      return res.status(200).json({ projects: serialized });
     } catch {
       return sendError(
         res, 500, "INTERNAL_ERROR", "Could not retrieve projects"
@@ -100,11 +146,131 @@ router.get(
         return sendError(res, 404, "NOT_FOUND", "Project not found");
       }
 
-      return res.status(200).json({ project });
+      return res.status(200).json({
+        project: await projectWithMilestones(project),
+      });
     } catch {
       return sendError(
         res, 500, "INTERNAL_ERROR", "Could not retrieve project"
       );
+    }
+  }
+);
+
+// PATCH /api/projects/:id - Client updates project details
+router.patch(
+  "/:id",
+  requireAuth,
+  requireRole("client"),
+  async (req: Request, res: Response) => {
+    try {
+      const { id } = req.params;
+
+      if (!mongoose.isValidObjectId(id)) {
+        return sendError(res, 400, "INVALID_ID", "Invalid project ID");
+      }
+
+      const parsed = updateProjectSchema.safeParse(req.body);
+
+      if (!parsed.success) {
+        return sendError(
+          res, 400, "VALIDATION_ERROR",
+          "Invalid project data", parsed.error.issues
+        );
+      }
+
+      const project = await Project.findOne({
+        _id: id,
+        clientId: req.user!._id,
+      });
+
+      if (!project) {
+        return sendError(res, 404, "NOT_FOUND", "Project not found");
+      }
+
+      if (parsed.data.totalBudget !== undefined) {
+        const milestones = await Milestone.find({ projectId: project._id }).select("amount");
+        const allocatedCents = milestones.reduce(
+          (sum, milestone) => sum + Math.round(milestone.amount * 100),
+          0
+        );
+        if (Math.round(parsed.data.totalBudget * 100) < allocatedCents) {
+          return sendError(
+            res, 409, "INVALID_STATE",
+            "Budget cannot be lower than the allocated milestone amounts"
+          );
+        }
+        project.totalBudget = parsed.data.totalBudget;
+      }
+
+      if (parsed.data.title !== undefined) project.title = parsed.data.title;
+      if (parsed.data.description !== undefined) project.description = parsed.data.description;
+
+      await project.save();
+
+      recordAudit({
+        actorId: req.user!._id,
+        projectId: project._id,
+        eventType: "project.updated",
+        eventData: { fields: Object.keys(parsed.data) },
+      });
+
+      return res.status(200).json({
+        project: await projectWithMilestones(project),
+      });
+    } catch {
+      return sendError(res, 500, "INTERNAL_ERROR", "Could not update project");
+    }
+  }
+);
+
+// GET /api/projects/:id/payments - Transaction history for project participants
+router.get(
+  "/:id/payments",
+  requireAuth,
+  async (req: Request, res: Response) => {
+    try {
+      const { id } = req.params;
+
+      if (!mongoose.isValidObjectId(id)) {
+        return sendError(res, 400, "INVALID_ID", "Invalid project ID");
+      }
+
+      const project = await Project.findById(id);
+
+      if (!project) {
+        return sendError(res, 404, "NOT_FOUND", "Project not found");
+      }
+
+      const userId = req.user!._id.toString();
+      const isParticipant =
+        project.clientId.toString() === userId ||
+        project.freelancerId?.toString() === userId;
+
+      if (!isParticipant) {
+        return sendError(res, 404, "NOT_FOUND", "Project not found");
+      }
+
+      const milestones = await Milestone.find({ projectId: project._id }).select("_id");
+      const payments = await Payment.find({
+        milestoneId: { $in: milestones.map((m) => m._id) },
+      }).sort({ createdAt: -1 });
+
+      return res.status(200).json({
+        payments: payments.map((payment) => ({
+          id: payment._id,
+          milestoneId: payment.milestoneId,
+          orderId: payment.orderId ?? null,
+          captureId: payment.captureId ?? null,
+          status: payment.status,
+          amount: payment.amount,
+          currency: payment.currency,
+          paidAt: payment.paidAt ?? null,
+          createdAt: payment.createdAt,
+        })),
+      });
+    } catch {
+      return sendError(res, 500, "INTERNAL_ERROR", "Could not retrieve payments");
     }
   }
 );
@@ -168,9 +334,16 @@ router.post(
         );
       }
 
+      recordAudit({
+        actorId: req.user!._id,
+        projectId: updatedProject._id,
+        eventType: "project.freelancer_invited",
+        eventData: { freelancerId: freelancer._id },
+      });
+
       return res.status(200).json({
         message: "Freelancer assigned successfully",
-        project: updatedProject,
+        project: await projectWithMilestones(updatedProject),
       });
     } catch {
       return sendError(

@@ -3,9 +3,9 @@ import type { FormEvent } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { EmptyState, ErrorNote, LoadingBlock, StatusBadge, SuccessNote, TextListEditor, useTitle } from '../components/ui'
 import { useAuth } from '../context/AuthProvider'
-import { createMilestone, getProject, inviteFreelancer } from '../lib/api'
+import { createMilestone, getProject, inviteFreelancer, listProjectPayments, updateProject } from '../lib/api'
 import { formatMoney, formatWhen, isMoney, statusHint } from '../lib/format'
-import type { Project } from '../lib/types'
+import type { Project, ProjectPayment } from '../lib/types'
 
 export function ProjectPage() {
   const { projectId = '' } = useParams()
@@ -85,12 +85,14 @@ export function ProjectPage() {
           <InviteCard project={project} canInvite={user.role === 'client'} onInvited={setProject} />
           {user.role === 'client' && (
             <>
+              <EditProjectCard project={project} onSaved={setProject} />
               <Link className="btn" to={`/projects/${project.id}/generate`}>
                 Suggest milestones with AI
               </Link>
               <AddMilestone project={project} onCreated={load} />
             </>
           )}
+          <PaymentsCard projectId={project.id} />
         </aside>
       </div>
     </div>
@@ -146,6 +148,120 @@ function InviteCard({
             {pending ? 'Inviting…' : 'Invite freelancer'}
           </button>
         </form>
+      )}
+    </section>
+  )
+}
+
+function EditProjectCard({ project, onSaved }: { project: Project; onSaved: (project: Project) => void }) {
+  const [open, setOpen] = useState(false)
+  const [title, setTitle] = useState(project.title)
+  const [description, setDescription] = useState(project.description)
+  const [budget, setBudget] = useState(String(project.totalAmount))
+  const [problem, setProblem] = useState<unknown>(null)
+  const [pending, setPending] = useState(false)
+
+  async function onSubmit(event: FormEvent) {
+    event.preventDefault()
+    const parsedBudget = Number(budget)
+    if (!isMoney(parsedBudget)) {
+      setProblem(new Error('Enter a valid budget with at most two decimal places.'))
+      return
+    }
+    setPending(true)
+    setProblem(null)
+    try {
+      const next = await updateProject(project.id, {
+        title: title.trim(),
+        description: description.trim(),
+        totalBudget: parsedBudget,
+      })
+      onSaved(next)
+      setOpen(false)
+    } catch (error) {
+      setProblem(error)
+    } finally {
+      setPending(false)
+    }
+  }
+
+  if (!open) {
+    return (
+      <button type="button" className="btn secondary" onClick={() => setOpen(true)}>
+        Edit project
+      </button>
+    )
+  }
+
+  return (
+    <form className="card stack" onSubmit={onSubmit}>
+      <h2>Edit project</h2>
+      <p className="hint">The budget cannot drop below the milestone amounts already allocated.</p>
+      <ErrorNote error={problem} />
+      <label className="field">
+        Title
+        <input value={title} onChange={(event) => setTitle(event.target.value)} required />
+      </label>
+      <label className="field">
+        Description
+        <textarea rows={4} value={description} onChange={(event) => setDescription(event.target.value)} required />
+      </label>
+      <label className="field">
+        Total budget ({project.currency})
+        <input inputMode="decimal" value={budget} onChange={(event) => setBudget(event.target.value)} required />
+      </label>
+      <div className="row">
+        <button className="btn" type="submit" disabled={pending}>
+          {pending ? 'Saving…' : 'Save changes'}
+        </button>
+        <button className="btn secondary" type="button" onClick={() => setOpen(false)}>
+          Cancel
+        </button>
+      </div>
+    </form>
+  )
+}
+
+function PaymentsCard({ projectId }: { projectId: string }) {
+  const [payments, setPayments] = useState<ProjectPayment[] | null>(null)
+  const [problem, setProblem] = useState<unknown>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    listProjectPayments(projectId)
+      .then((rows) => {
+        if (!cancelled) setPayments(rows)
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) setProblem(error)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [projectId])
+
+  return (
+    <section className="card stack">
+      <h2>Transaction history</h2>
+      {payments === null && !problem && <p className="hint">Loading payments…</p>}
+      <ErrorNote error={problem} />
+      {payments && payments.length === 0 && <p className="hint">No payments yet. They appear after a client pays an approved milestone.</p>}
+      {payments && payments.length > 0 && (
+        <ul className="history">
+          {payments.map((payment) => (
+            <li key={payment.id}>
+              <div className="row spread">
+                <strong>{formatMoney(payment.amount, payment.currency)}</strong>
+                <span className="chip">{payment.status}</span>
+              </div>
+              <p className="hint">
+                {formatWhen(payment.paidAt ?? payment.createdAt)}
+                {payment.orderId ? ` · order ${payment.orderId}` : ''}
+                {payment.captureId ? ` · capture ${payment.captureId}` : ''}
+              </p>
+            </li>
+          ))}
+        </ul>
       )}
     </section>
   )

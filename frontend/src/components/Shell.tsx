@@ -27,7 +27,7 @@ export function Shell() {
         <div>
           <Logo />
           <nav className="side-nav" aria-label="Main">
-            <NavLink to="/" end>
+            <NavLink to="/dashboard" end>
               Projects
             </NavLink>
             {user?.role === 'client' && <NavLink to="/projects/new">New project</NavLink>}

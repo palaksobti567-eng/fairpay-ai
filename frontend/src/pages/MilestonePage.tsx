@@ -17,11 +17,16 @@ import { useAuth } from '../context/AuthProvider'
 import {
   approveCriteria,
   approveMilestone,
+  completeMilestoneVerification,
   getMilestone,
   getPayment,
   getReport,
+  getRevisionSuggestions,
+  getScreenshot,
   listSubmissions,
   rejectMilestone,
+  startMilestone,
+  startMilestoneVerification,
   startVerification,
   submitEvidence,
   updateMilestone,
@@ -30,14 +35,18 @@ import { isApiError } from '../lib/errors'
 import { formatMoney, formatWhen, isMoney, previewUrlError, screenshotError, statusHint } from '../lib/format'
 import {
   canApproveCriteria,
+  canCompleteVerification,
   canDecide,
   canEditMilestone,
   canPay,
+  canRejectWork,
+  canRunVerification,
+  canStartMilestone,
   canStartVerification,
   canSubmitEvidence,
   canViewReceipt,
 } from '../lib/permissions'
-import type { Milestone, Payment, Report, Submission } from '../lib/types'
+import type { Milestone, Payment, Report, RevisionSuggestion, Submission } from '../lib/types'
 
 export function MilestonePage() {
   const { milestoneId = '' } = useParams()
@@ -180,14 +189,32 @@ export function MilestonePage() {
             ))}
           </ol>
         )}
-        {canApproveCriteria(user, milestone.status) && !canEditMilestone(user, milestone.status) ? null : null}
       </section>
 
       {milestone.status === 'draft' && user.role === 'freelancer' && (
         <p className="hint">The client is still reviewing the criteria. You can submit evidence after they approve them.</p>
       )}
+      {canApproveCriteria(user, milestone.status) && (
+        <ApproveCriteriaButton
+          milestoneId={milestone.id}
+          onApproved={async () => {
+            setNotice('Criteria approved. You can start the work or submit evidence.')
+            await load()
+          }}
+        />
+      )}
       {milestone.status === 'criteria_approved' && user.role === 'client' && (
         <p className="hint">Criteria are locked. The freelancer can submit evidence when the work is ready.</p>
+      )}
+
+      {canStartMilestone(user, milestone.status) && (
+        <StartWorkButton
+          milestoneId={milestone.id}
+          onStarted={async () => {
+            setNotice('Work started. Submit evidence when it is ready.')
+            await load()
+          }}
+        />
       )}
 
       {canSubmitEvidence(user, milestone.status) && (
@@ -221,11 +248,45 @@ export function MilestonePage() {
               )}
             </article>
           ))}
-          {canStartVerification(user, milestone.status) && submissions[0] && (
+          {canStartVerification(user, milestone.status) && (
+            <StartVerificationButton
+              milestoneId={milestone.id}
+              onStarted={async () => {
+                setNotice('Verification started. Run the browser check, then complete it when the report is ready.')
+                await load()
+              }}
+            />
+          )}
+          {canRejectWork(user, milestone.status) && (
+            <RejectWorkButton
+              milestoneId={milestone.id}
+              onDone={async (message) => {
+                setNotice(message)
+                await load()
+              }}
+            />
+          )}
+        </section>
+      )}
+
+      {milestone.status === 'verifying' && user.role === 'client' && submissions[0] && (
+        <section className="card stack">
+          <h2>Verification</h2>
+          {canRunVerification(user, milestone.status) && report?.state !== 'done' && (
             <VerifyButton
               submissionId={submissions[0].id}
               onStarted={async () => {
                 setNotice('Verification is running. This page checks the report every 3 seconds.')
+                await load()
+              }}
+            />
+          )}
+          {canCompleteVerification(user, milestone.status) && report?.state === 'done' && (
+            <CompleteVerificationButton
+              milestoneId={milestone.id}
+              reportId={report.id}
+              onDone={async (message) => {
+                setNotice(message)
                 await load()
               }}
             />
@@ -245,6 +306,10 @@ export function MilestonePage() {
       )}
 
       {report && report.state === 'done' && <ReportView report={report} />}
+
+      {report && report.state === 'done' && report.results.some((r) => r.status !== 'completed') && (
+        <RevisionSuggestions milestoneId={milestone.id} />
+      )}
 
       {canDecide(user, milestone.status) && report?.state === 'done' && (
         <Decision
@@ -302,7 +367,6 @@ function CriteriaEditor({
   const [criteria, setCriteria] = useState(milestone.criteria.map((item) => item.text))
   const [problem, setProblem] = useState<unknown>(null)
   const [pending, setPending] = useState(false)
-  const [confirming, setConfirming] = useState(false)
   const dirty =
     title.trim() !== milestone.title ||
     Number(amount) !== milestone.amount ||
@@ -330,20 +394,6 @@ function CriteriaEditor({
     }
   }
 
-  async function approve() {
-    setPending(true)
-    setProblem(null)
-    try {
-      await approveCriteria(milestone.id)
-      setConfirming(false)
-      await onSaved('Criteria approved. The freelancer can see what done means.')
-    } catch (error) {
-      setProblem(error)
-    } finally {
-      setPending(false)
-    }
-  }
-
   return (
     <form className="stack" onSubmit={(event) => void save(event)}>
       <ErrorNote error={problem} />
@@ -360,24 +410,8 @@ function CriteriaEditor({
         <button className="btn secondary" type="submit" disabled={pending || !dirty}>
           {pending ? 'Saving…' : 'Save draft'}
         </button>
-        <button className="btn" type="button" disabled={pending || dirty} onClick={() => setConfirming(true)}>
-          Approve criteria
-        </button>
       </div>
-      {dirty && <p className="hint">Save changes before approving criteria.</p>}
-      {confirming && (
-        <Modal title="Approve these criteria?" onClose={() => setConfirming(false)}>
-          <p>Approving locks the criteria. Both sides will use them as the definition of done for this milestone.</p>
-          <div className="row">
-            <button type="button" className="btn" disabled={pending} onClick={() => void approve()}>
-              {pending ? 'Approving…' : 'Approve criteria'}
-            </button>
-            <button type="button" className="btn secondary" onClick={() => setConfirming(false)}>
-              Cancel
-            </button>
-          </div>
-        </Modal>
-      )}
+      <p className="hint">The assigned freelancer approves the criteria. Saving here does not approve them.</p>
     </form>
   )
 }
@@ -446,6 +480,56 @@ function EvidenceForm({ milestoneId, onSubmitted }: { milestoneId: string; onSub
   )
 }
 
+function ApproveCriteriaButton({ milestoneId, onApproved }: { milestoneId: string; onApproved: () => Promise<void> }) {
+  const [pending, setPending] = useState(false)
+  const [problem, setProblem] = useState<unknown>(null)
+  const [confirming, setConfirming] = useState(false)
+
+  return (
+    <section className="card stack">
+      <h2>Review the criteria</h2>
+      <p className="hint">
+        Approving locks the criteria as the definition of done for this milestone. The client can still edit them while
+        the milestone is a draft.
+      </p>
+      <ErrorNote error={problem} />
+      <div>
+        <button type="button" className="btn" disabled={pending} onClick={() => setConfirming(true)}>
+          Approve criteria
+        </button>
+      </div>
+      {confirming && (
+        <Modal title="Approve these criteria?" onClose={() => setConfirming(false)}>
+          <p>You confirm the acceptance criteria are clear and achievable. They lock once approved.</p>
+          <div className="row">
+            <button
+              type="button"
+              className="btn"
+              disabled={pending}
+              onClick={() => {
+                setPending(true)
+                setProblem(null)
+                approveCriteria(milestoneId)
+                  .then(() => {
+                    setConfirming(false)
+                    return onApproved()
+                  })
+                  .catch((error: unknown) => setProblem(error))
+                  .finally(() => setPending(false))
+              }}
+            >
+              {pending ? 'Approving…' : 'Approve criteria'}
+            </button>
+            <button type="button" className="btn secondary" onClick={() => setConfirming(false)}>
+              Cancel
+            </button>
+          </div>
+        </Modal>
+      )}
+    </section>
+  )
+}
+
 function VerifyButton({ submissionId, onStarted }: { submissionId: string; onStarted: () => Promise<void> }) {
   const [pending, setPending] = useState(false)
   const [problem, setProblem] = useState<unknown>(null)
@@ -466,9 +550,154 @@ function VerifyButton({ submissionId, onStarted }: { submissionId: string; onSta
             .finally(() => setPending(false))
         }}
       >
-        {pending ? 'Starting…' : 'Start AI verification'}
+        {pending ? 'Starting…' : 'Run browser check'}
       </button>
-      <p className="hint">Either person on the project can start the check. It runs in the background and does not approve the work.</p>
+      <p className="hint">The read-only browser opens the public preview and writes a report. It does not approve the work.</p>
+    </div>
+  )
+}
+
+function StartWorkButton({ milestoneId, onStarted }: { milestoneId: string; onStarted: () => Promise<void> }) {
+  const [pending, setPending] = useState(false)
+  const [problem, setProblem] = useState<unknown>(null)
+
+  return (
+    <section className="card stack">
+      <h2>Start the work</h2>
+      <p className="hint">The criteria are approved. Mark the milestone in progress, then submit evidence when it is ready.</p>
+      <ErrorNote error={problem} />
+      <div>
+        <button
+          type="button"
+          className="btn"
+          disabled={pending}
+          onClick={() => {
+            setPending(true)
+            setProblem(null)
+            startMilestone(milestoneId)
+              .then(() => onStarted())
+              .catch((error: unknown) => setProblem(error))
+              .finally(() => setPending(false))
+          }}
+        >
+          {pending ? 'Starting…' : 'Start work'}
+        </button>
+      </div>
+    </section>
+  )
+}
+
+function StartVerificationButton({ milestoneId, onStarted }: { milestoneId: string; onStarted: () => Promise<void> }) {
+  const [pending, setPending] = useState(false)
+  const [problem, setProblem] = useState<unknown>(null)
+
+  return (
+    <div className="stack tight">
+      <ErrorNote error={problem} />
+      <button
+        type="button"
+        className="btn"
+        disabled={pending}
+        onClick={() => {
+          setPending(true)
+          setProblem(null)
+          startMilestoneVerification(milestoneId)
+            .then(() => onStarted())
+            .catch((error: unknown) => setProblem(error))
+            .finally(() => setPending(false))
+        }}
+      >
+        {pending ? 'Starting…' : 'Start verification'}
+      </button>
+      <p className="hint">Moves the milestone into verification. The browser check runs next and does not approve the work.</p>
+    </div>
+  )
+}
+
+function CompleteVerificationButton({
+  milestoneId,
+  reportId,
+  onDone,
+}: {
+  milestoneId: string
+  reportId: string
+  onDone: (message: string) => Promise<void>
+}) {
+  const [pending, setPending] = useState(false)
+  const [problem, setProblem] = useState<unknown>(null)
+
+  return (
+    <div className="stack tight">
+      <ErrorNote error={problem} />
+      <button
+        type="button"
+        className="btn"
+        disabled={pending}
+        onClick={() => {
+          setPending(true)
+          setProblem(null)
+          completeMilestoneVerification(milestoneId, reportId)
+            .then(() => onDone('Verification completed. The report is ready for your decision.'))
+            .catch((error: unknown) => setProblem(error))
+            .finally(() => setPending(false))
+        }}
+      >
+        {pending ? 'Completing…' : 'Complete verification'}
+      </button>
+      <p className="hint">
+        Marks the check as finished. The milestone moves to report review only when every criterion passed the browser
+        check. If something is missing, reject the work instead.
+      </p>
+    </div>
+  )
+}
+
+function RejectWorkButton({ milestoneId, onDone }: { milestoneId: string; onDone: (message: string) => Promise<void> }) {
+  const [open, setOpen] = useState(false)
+  const [reason, setReason] = useState('')
+  const [pending, setPending] = useState(false)
+  const [problem, setProblem] = useState<unknown>(null)
+
+  async function reject() {
+    if (reason.trim().length < 10) {
+      setProblem(new Error('Give a reason of at least 10 characters so the freelancer knows what to change.'))
+      return
+    }
+    setPending(true)
+    setProblem(null)
+    try {
+      await rejectMilestone(milestoneId, reason.trim())
+      setOpen(false)
+      await onDone('The milestone was sent back to the freelancer.')
+    } catch (error) {
+      setProblem(error)
+    } finally {
+      setPending(false)
+    }
+  }
+
+  return (
+    <div className="stack tight">
+      <button type="button" className="btn danger" onClick={() => setOpen(true)}>
+        Reject work
+      </button>
+      {open && (
+        <Modal title="Reject this milestone" onClose={() => setOpen(false)}>
+          <ErrorNote error={problem} />
+          <label className="field">
+            Reason
+            <textarea rows={4} value={reason} onChange={(event) => setReason(event.target.value)} required />
+          </label>
+          <div className="row">
+            <button type="button" className="btn danger" disabled={pending || reason.trim().length < 10} onClick={() => void reject()}>
+              {pending ? 'Sending…' : 'Reject and send back'}
+            </button>
+            <button type="button" className="btn secondary" onClick={() => setOpen(false)}>
+              Cancel
+            </button>
+          </div>
+        </Modal>
+      )}
     </div>
   )
 }
@@ -486,8 +715,8 @@ function ReportView({ report }: { report: Report }) {
         <span className="hint">Unverified means the system could not check it. That is not a failure.</span>
       </div>
       <div className="shots">
-        <Shot label="Desktop" url={report.screenshots.desktop} />
-        <Shot label="Mobile" url={report.screenshots.mobile} />
+        <ReportShot label="Desktop" device="desktop" screenshotId={report.screenshotId} url={report.screenshots.desktop} />
+        <ReportShot label="Mobile" device="mobile" screenshotId={report.screenshotId} url={report.screenshots.mobile} />
       </div>
       <ul className="results">
         {report.results.map((result) => (
@@ -505,13 +734,84 @@ function ReportView({ report }: { report: Report }) {
   )
 }
 
-function Shot({ label, url }: { label: string; url: string }) {
+function RevisionSuggestions({ milestoneId }: { milestoneId: string }) {
+  const [suggestions, setSuggestions] = useState<RevisionSuggestion[] | null>(null)
+  const [problem, setProblem] = useState<unknown>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    getRevisionSuggestions(milestoneId)
+      .then((rows) => {
+        if (!cancelled) setSuggestions(rows)
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) setProblem(error)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [milestoneId])
+
+  if (problem) return null
+  if (!suggestions || suggestions.length === 0) return null
+
+  return (
+    <section className="card stack">
+      <p className="eyebrow">Revision guidance</p>
+      <h2>What to fix</h2>
+      <p className="note">AI-assisted suggestions tied to the unmet criteria. The client still decides.</p>
+      <ul className="results">
+        {suggestions.map((item) => (
+          <li key={item.criterionId}>
+            <p className="criterion-text">{item.criterion}</p>
+            <p>{item.suggestion}</p>
+          </li>
+        ))}
+      </ul>
+    </section>
+  )
+}
+
+function ReportShot({
+  label,
+  device,
+  screenshotId,
+  url,
+}: {
+  label: string
+  device: 'desktop' | 'mobile'
+  screenshotId?: string | null
+  url: string
+}) {
+  const [src, setSrc] = useState(url)
   const [broken, setBroken] = useState(false)
+
+  useEffect(() => {
+    setSrc(url)
+    setBroken(false)
+    if (!screenshotId) return
+    let objectUrl: string | null = null
+    let cancelled = false
+    getScreenshot(screenshotId, device)
+      .then((blob) => {
+        if (cancelled) return
+        objectUrl = URL.createObjectURL(blob)
+        setSrc(objectUrl)
+      })
+      .catch(() => {
+        if (!cancelled) setSrc(url)
+      })
+    return () => {
+      cancelled = true
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [screenshotId, device, url])
+
   return (
     <figure>
       <figcaption>{label}</figcaption>
-      {url && !broken ? (
-        <img src={url} alt={`${label} screenshot from the read-only check`} onError={() => setBroken(true)} />
+      {src && !broken ? (
+        <img src={src} alt={`${label} screenshot from the read-only check`} onError={() => setBroken(true)} />
       ) : (
         <div className="shot-empty">No screenshot captured</div>
       )}
@@ -529,7 +829,6 @@ function Decision({
   onDone: (message: string) => Promise<void>
 }) {
   const [mode, setMode] = useState<'approve' | 'reject' | null>(null)
-  const [note, setNote] = useState('')
   const [reason, setReason] = useState('')
   const [pending, setPending] = useState(false)
   const [problem, setProblem] = useState<unknown>(null)
@@ -538,7 +837,7 @@ function Decision({
     setPending(true)
     setProblem(null)
     try {
-      await approveMilestone(milestoneId, { reportId, note })
+      await approveMilestone(milestoneId, { reportId })
       setMode(null)
       await onDone('You approved the work. Payment is now available.')
     } catch (error) {
@@ -549,8 +848,8 @@ function Decision({
   }
 
   async function reject() {
-    if (!reason.trim()) {
-      setProblem(new Error('A reason is required.'))
+    if (reason.trim().length < 10) {
+      setProblem(new Error('Give a reason of at least 10 characters so the freelancer knows what to change.'))
       return
     }
     setPending(true)
@@ -581,10 +880,7 @@ function Decision({
       </div>
       {mode === 'approve' && (
         <Modal title="You confirm the work meets the criteria. Continue to payment?" onClose={() => setMode(null)}>
-          <label className="field">
-            Note, optional
-            <textarea rows={3} value={note} onChange={(event) => setNote(event.target.value)} />
-          </label>
+          <p className="hint">Approving records your decision. The payment step opens next.</p>
           <div className="row">
             <button type="button" className="btn" disabled={pending} onClick={() => void approve()}>
               {pending ? 'Approving…' : 'Continue to payment'}
@@ -602,7 +898,7 @@ function Decision({
             <textarea rows={4} value={reason} onChange={(event) => setReason(event.target.value)} required />
           </label>
           <div className="row">
-            <button type="button" className="btn danger" disabled={pending || !reason.trim()} onClick={() => void reject()}>
+            <button type="button" className="btn danger" disabled={pending || reason.trim().length < 10} onClick={() => void reject()}>
               {pending ? 'Sending…' : 'Reject and send back'}
             </button>
             <button type="button" className="btn secondary" onClick={() => setMode(null)}>

@@ -36,6 +36,8 @@ app.use(
   })
 );
 
+// PayPal webhook needs the raw body for signature verification.
+app.use("/api/payments/webhook", express.raw({ type: "*/*" }));
 app.use(express.json());
 app.use("/api/screenshots", screenshotRoutes);
 app.use("/api/auth", authRoutes);

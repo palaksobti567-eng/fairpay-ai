@@ -24,4 +24,9 @@ export const createSubmissionSchema = z.object({
       "Preview URL must use HTTPS"
     )
     .optional(),
+
+  screenshots: z
+    .array(z.string().trim().min(1).max(2000))
+    .max(10, "Maximum 10 screenshots are allowed")
+    .optional(),
 });

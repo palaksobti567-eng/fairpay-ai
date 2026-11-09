@@ -14,7 +14,9 @@ import {
   createPayPalOrder,
   getPayPalOrder,
   capturePayPalOrder,
+  verifyPayPalWebhookSignature,
 } from "../services/paypal";
+import { recordAudit } from "../utils/audit";
 
 const router = Router();
 
@@ -85,8 +87,11 @@ router.post("/create-order", async (req: Request, res: Response) => {
       );
     }
 
-    // 5. Milestone must be approved
-    if (milestone.status !== "approved") {
+    // 5. Milestone must be approved, or payment_failed for a retry.
+    if (
+      milestone.status !== "approved" &&
+      milestone.status !== "payment_failed"
+    ) {
       return sendError(
         res,
         409,
@@ -214,6 +219,14 @@ router.post("/create-order", async (req: Request, res: Response) => {
         "PayPal order was created but no approval link was returned"
       );
     }
+
+    recordAudit({
+      actorId: req.user!._id,
+      projectId: project._id,
+      milestoneId: milestone._id,
+      eventType: "payment.order_created",
+      eventData: { orderId: order.id },
+    });
 
     return res.status(201).json({
       message: "PayPal order created successfully",
@@ -396,6 +409,11 @@ async function respondPaymentCompleted(
   milestoneId: mongoose.Types.ObjectId,
   message: string
 ) {
+  recordAudit({
+    milestoneId,
+    eventType: "payment.captured",
+    eventData: { orderId: payment.orderId, captureId: payment.captureId },
+  });
   const milestoneUpdated = await markMilestonePaid(milestoneId);
 
   const paymentBody = {
@@ -501,7 +519,11 @@ router.post("/capture-order", async (req: Request, res: Response) => {
       );
     }
 
-    if (milestone.status !== "approved" && milestone.status !== "paid") {
+    if (
+      milestone.status !== "approved" &&
+      milestone.status !== "payment_failed" &&
+      milestone.status !== "paid"
+    ) {
       return sendError(
         res,
         409,
@@ -811,7 +833,7 @@ router.post("/capture-order", async (req: Request, res: Response) => {
 
       if (failedPayment) {
         await Milestone.updateOne(
-          { _id: milestone._id, status: "approved" },
+          { _id: milestone._id, status: { $in: ["approved", "payment_failed"] } },
           { $set: { status: "payment_failed" } }
         );
       }
@@ -845,6 +867,159 @@ router.post("/capture-order", async (req: Request, res: Response) => {
       "PAYMENT_STATUS_UNCONFIRMED",
       "Unable to confirm payment status. Retry using the same order ID."
     );
+  }
+});
+
+// GET /api/payments/:id
+// Project participants can read a single payment record.
+router.get("/:id", async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+
+    if (!mongoose.isValidObjectId(id)) {
+      return sendError(res, 400, "INVALID_ID", "Invalid payment ID");
+    }
+
+    const payment = await Payment.findById(id);
+
+    if (!payment) {
+      return sendError(res, 404, "NOT_FOUND", "Payment not found");
+    }
+
+    const milestone = await Milestone.findById(payment.milestoneId);
+    const project = milestone ? await Project.findById(milestone.projectId) : null;
+
+    if (!project) {
+      return sendError(res, 404, "NOT_FOUND", "Payment not found");
+    }
+
+    const userId = req.user!._id.toString();
+    const isParticipant =
+      project.clientId.toString() === userId ||
+      project.freelancerId?.toString() === userId;
+
+    if (!isParticipant) {
+      return sendError(res, 404, "NOT_FOUND", "Payment not found");
+    }
+
+    return res.status(200).json({
+      payment: {
+        id: payment._id,
+        milestoneId: payment.milestoneId,
+        orderId: payment.orderId ?? null,
+        captureId: payment.captureId ?? null,
+        status: payment.status,
+        amount: payment.amount,
+        currency: payment.currency,
+        paidAt: payment.paidAt ?? null,
+        createdAt: payment.createdAt,
+      },
+    });
+  } catch (error) {
+    console.error(
+      "Get payment error:",
+      error instanceof Error ? error.name : "unknown error"
+    );
+    return sendError(res, 500, "PAYMENT_STATUS_ERROR", "Unable to retrieve payment");
+  }
+});
+
+// POST /api/payments/webhook
+// PayPal event notifications. Signature is verified before any state change,
+// and each event id is applied at most once (idempotent).
+router.post("/webhook", async (req: Request, res: Response) => {
+  try {
+    const rawBody = Buffer.isBuffer(req.body)
+      ? req.body.toString("utf8")
+      : JSON.stringify(req.body ?? {});
+
+    let event: any;
+    try {
+      event = JSON.parse(rawBody);
+    } catch {
+      return sendError(res, 400, "INVALID_PAYLOAD", "Invalid webhook payload");
+    }
+
+    const headers = {
+      authAlgo: String(req.headers["paypal-auth-algo"] ?? ""),
+      certUrl: String(req.headers["paypal-cert-url"] ?? ""),
+      transmissionId: String(req.headers["paypal-transmission-id"] ?? ""),
+      transmissionSig: String(req.headers["paypal-transmission-sig"] ?? ""),
+      transmissionTime: String(req.headers["paypal-transmission-time"] ?? ""),
+    };
+
+    if (Object.values(headers).some((value) => !value)) {
+      return sendError(res, 400, "INVALID_HEADERS", "Missing PayPal webhook headers");
+    }
+
+    const verified = await verifyPayPalWebhookSignature({
+      headers,
+      webhookEvent: event,
+    });
+
+    if (!verified) {
+      return sendError(res, 400, "INVALID_SIGNATURE", "Webhook signature verification failed");
+    }
+
+    const eventId = String(event.id ?? "");
+    if (!eventId) {
+      return sendError(res, 400, "INVALID_PAYLOAD", "Webhook event has no id");
+    }
+
+    recordAudit({
+      eventType: "payment.webhook",
+      eventData: { eventId, eventType: event.event_type },
+    });
+
+    // Only completed captures change state. Everything else is acknowledged.
+    if (event.event_type !== "PAYMENT.CAPTURE.COMPLETED") {
+      return res.status(200).json({ received: true });
+    }
+
+    const resource = event.resource ?? {};
+    const captureId = String(resource.id ?? "");
+    const orderId = String(
+      resource.supplementary_data?.related_ids?.order_id ?? ""
+    );
+
+    if (!captureId || !orderId) {
+      return res.status(200).json({ received: true });
+    }
+
+    const payment = await Payment.findOne({ orderId });
+
+    if (!payment) {
+      return res.status(200).json({ received: true });
+    }
+
+    // Idempotency: an event id is applied at most once per payment.
+    if (payment.webhookEventIds?.includes(eventId)) {
+      return res.status(200).json({ received: true, duplicate: true });
+    }
+
+    const completed = await completePayment(payment._id, captureId);
+
+    if (completed) {
+      await Payment.updateOne(
+        { _id: payment._id },
+        { $addToSet: { webhookEventIds: eventId } }
+      );
+      await markMilestonePaid(payment.milestoneId);
+      recordAudit({
+        projectId: undefined,
+        milestoneId: payment.milestoneId,
+        eventType: "payment.completed",
+        eventData: { source: "webhook", eventId, orderId, captureId },
+      });
+    }
+
+    return res.status(200).json({ received: true });
+  } catch (error) {
+    console.error(
+      "Payment webhook error:",
+      error instanceof Error ? error.name : "unknown error"
+    );
+    return sendError(res, 500, "WEBHOOK_ERROR", "Unable to process webhook");
   }
 });
 

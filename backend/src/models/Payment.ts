@@ -14,6 +14,7 @@ export interface IPayment extends Document {
   requestId: string;
   captureRequestId?: string;
   captureStartedAt?: Date;
+  webhookEventIds?: string[];
   status: PaymentStatus;
   amount: number;
   currency: string;
@@ -54,6 +55,10 @@ const paymentSchema = new Schema<IPayment>(
    captureStartedAt: {
       type: Date,
 },
+    webhookEventIds: {
+      type: [String],
+      default: [],
+    },
     status: {
       type: String,
       enum: ["created", "capturing", "completed", "failed"],

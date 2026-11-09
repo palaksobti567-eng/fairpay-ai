@@ -1,7 +1,8 @@
 
 import "dotenv/config";
 
-const PAYPAL_BASE_URL = "https://api-m.sandbox.paypal.com";
+const PAYPAL_BASE_URL =
+  process.env.PAYPAL_BASE_URL || "https://api-m.sandbox.paypal.com";
 
 export interface CreatePayPalOrderInput {
   amount: number;
@@ -158,6 +159,48 @@ export async function getPayPalOrder(
       },
     }
   );
+}
+
+export interface WebhookHeaders {
+  authAlgo: string;
+  certUrl: string;
+  transmissionId: string;
+  transmissionSig: string;
+  transmissionTime: string;
+}
+
+export async function verifyPayPalWebhookSignature(input: {
+  headers: WebhookHeaders;
+  webhookEvent: unknown;
+}): Promise<boolean> {
+  const webhookId = process.env.PAYPAL_WEBHOOK_ID;
+  if (!webhookId) {
+    throw new PayPalError("PayPal webhook ID is not configured.");
+  }
+
+  const token = await getPayPalAccessToken();
+
+  const data = await paypalRequest<{ verification_status: string }>(
+    "/v1/notifications/verify-webhook-signature",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        auth_algo: input.headers.authAlgo,
+        cert_url: input.headers.certUrl,
+        transmission_id: input.headers.transmissionId,
+        transmission_sig: input.headers.transmissionSig,
+        transmission_time: input.headers.transmissionTime,
+        webhook_id: webhookId,
+        webhook_event: input.webhookEvent,
+      }),
+    }
+  );
+
+  return data.verification_status === "SUCCESS";
 }
 
 export async function capturePayPalOrder(

@@ -15,6 +15,7 @@ import {
   type InspectionObservations,
 } from "../services/inspector";
 import { saveInspectionScreenshots } from "../services/screenshotStorage";
+import { recordAudit } from "../utils/audit";
 import {
   AiVerificationError,
   parseInspectionObservations,
@@ -350,6 +351,14 @@ router.post(
 
       await report.save();
 
+      recordAudit({
+        actorId: req.user!._id,
+        projectId: project._id,
+        milestoneId: milestone._id,
+        eventType: "verification.completed",
+        eventData: { submissionId: submission._id, reportId: report._id },
+      });
+
       reportId = undefined;
       milestoneId = undefined;
 
@@ -450,7 +459,14 @@ router.get(
         );
       }
 
-      return res.status(200).json({ report });
+      const screenshot = await Screenshot.findOne({
+        submissionId: submission._id,
+      }).select("_id");
+
+      return res.status(200).json({
+        report,
+        screenshotId: screenshot?._id ?? null,
+      });
     } catch (error) {
       console.error(
         "Get verification report error:",

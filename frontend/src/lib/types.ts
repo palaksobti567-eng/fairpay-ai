@@ -52,9 +52,12 @@ export type Project = {
 export type Submission = {
   id: string
   milestoneId: string
+  projectId?: string
+  freelancerId?: string
   description: string
   previewUrl: string
   screenshots: string[]
+  source?: string
   createdAt: string
 }
 
@@ -78,10 +81,11 @@ export type Report = {
     desktop: string
     mobile: string
   }
+  screenshotId?: string | null
   createdAt: string
 }
 
-export type PaymentStatus = 'created' | 'completed' | 'failed'
+export type PaymentStatus = 'created' | 'capturing' | 'completed' | 'failed'
 
 export type Payment = {
   id: string
@@ -92,6 +96,26 @@ export type Payment = {
   amount: number
   currency: string
   paidAt: string | null
+  createdAt?: string
+  milestoneStatus?: MilestoneStatus
+}
+
+export type ProjectPayment = {
+  id: string
+  milestoneId: string
+  orderId: string | null
+  captureId: string | null
+  status: PaymentStatus
+  amount: number
+  currency: string
+  paidAt: string | null
+  createdAt: string
+}
+
+export type RevisionSuggestion = {
+  criterionId: string
+  criterion: string
+  suggestion: string
 }
 
 export type MilestoneSuggestion = {
@@ -104,6 +128,8 @@ export type PayPalOrder = {
   orderId: string
   amount: number
   currency: string
+  approvalUrl?: string | null
+  orderStatus?: string
 }
 
 export type ApiErrorDetail = {

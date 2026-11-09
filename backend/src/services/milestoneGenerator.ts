@@ -123,3 +123,88 @@ export async function generateMilestones(
     "The AI could not produce milestones that match the budget. Please try again."
   );
 }
+
+const revisionSchema = z.object({
+  suggestions: z
+    .array(
+      z.object({
+        criterionId: z.string(),
+        suggestion: z.string().min(10).max(500),
+      })
+    )
+    .min(1)
+    .max(10),
+});
+
+export type RevisionInput = {
+  criteria: { id: string; text: string }[];
+  results: { criterionId: string; status: string; reason: string }[];
+};
+
+export type RevisionSuggestion = {
+  criterionId: string;
+  criterion: string;
+  suggestion: string;
+};
+
+export async function generateRevisionSuggestions(
+  input: RevisionInput
+): Promise<RevisionSuggestion[]> {
+  const modelId = process.env.GEMINI_MODEL;
+  if (!modelId) {
+    throw new AiGenerationError("AI_UNAVAILABLE", "AI model is not configured");
+  }
+
+  const unmet = input.criteria.filter((criterion) =>
+    input.results.some(
+      (result) =>
+        result.criterionId === criterion.id &&
+        result.status !== "completed"
+    )
+  );
+
+  if (unmet.length === 0) return [];
+
+  const payload = unmet
+    .map((criterion) => {
+      const result = input.results.find((r) => r.criterionId === criterion.id);
+      return (
+        "- criterionId: " + criterion.id +
+        "\n  criterion: " + criterion.text +
+        "\n  status: " + (result?.status ?? "unverified") +
+        "\n  finding: " + (result?.reason ?? "")
+      );
+    })
+    .join("\n");
+
+  try {
+    const { output } = await generateText({
+      model: google(modelId),
+      abortSignal: AbortSignal.timeout(30000),
+      output: Output.object({ schema: revisionSchema }),
+      prompt:
+        "A freelancer submitted work that did not fully satisfy these acceptance criteria. " +
+        "For EACH criterionId below, write one specific, actionable revision suggestion " +
+        "the freelancer can follow. Tie each suggestion to the unmet criterion and its finding. " +
+        "Do not give generic advice.\n\n" + payload,
+    });
+
+    const byId = new Map(input.criteria.map((c) => [c.id, c.text]));
+    return output.suggestions
+      .filter((item) => byId.has(item.criterionId))
+      .map((item) => ({
+        criterionId: item.criterionId,
+        criterion: byId.get(item.criterionId) ?? item.criterionId,
+        suggestion: item.suggestion.trim(),
+      }));
+  } catch (err) {
+    console.error(
+      "AI revision call failed:",
+      err instanceof Error ? err.name : "unknown error"
+    );
+    throw new AiGenerationError(
+      "AI_UNAVAILABLE",
+      "The AI service is unavailable. Please try again."
+    );
+  }
+}

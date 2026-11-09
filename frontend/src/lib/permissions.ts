@@ -5,7 +5,11 @@ export function canEditMilestone(user: User, status: MilestoneStatus) {
 }
 
 export function canApproveCriteria(user: User, status: MilestoneStatus) {
-  return user.role === 'client' && status === 'draft'
+  return user.role === 'freelancer' && status === 'draft'
+}
+
+export function canStartMilestone(user: User, status: MilestoneStatus) {
+  return user.role === 'freelancer' && status === 'criteria_approved'
 }
 
 export function canSubmitEvidence(user: User, status: MilestoneStatus) {
@@ -13,7 +17,19 @@ export function canSubmitEvidence(user: User, status: MilestoneStatus) {
 }
 
 export function canStartVerification(user: User, status: MilestoneStatus) {
-  return (user.role === 'client' || user.role === 'freelancer') && status === 'submitted'
+  return user.role === 'client' && status === 'submitted'
+}
+
+export function canRunVerification(user: User, status: MilestoneStatus) {
+  return user.role === 'client' && status === 'verifying'
+}
+
+export function canCompleteVerification(user: User, status: MilestoneStatus) {
+  return user.role === 'client' && status === 'verifying'
+}
+
+export function canRejectWork(user: User, status: MilestoneStatus) {
+  return user.role === 'client' && (status === 'submitted' || status === 'verifying')
 }
 
 export function canDecide(user: User, status: MilestoneStatus) {

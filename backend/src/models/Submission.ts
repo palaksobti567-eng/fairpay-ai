@@ -9,6 +9,7 @@ export interface ISubmission extends Document {
   freelancerId: mongoose.Types.ObjectId;
   description: string;
   previewUrl?: string;
+  screenshots: string[];
   source: SubmissionSource;
   createdAt: Date;
 }
@@ -47,6 +48,15 @@ const submissionSchema = new Schema<ISubmission>(
       type: String,
       trim: true,
       maxlength: 2000,
+    },
+
+    screenshots: {
+      type: [String],
+      default: [],
+      validate: {
+        validator: (links: string[]) => links.length <= 10,
+        message: "Maximum 10 screenshots are allowed",
+      },
     },
 
     source: {

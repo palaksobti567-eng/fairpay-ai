@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { ErrorNote, LoadingBlock, TextListEditor, useTitle } from '../components/ui'
-import { createMilestone, generateMilestones, getProject } from '../lib/api'
+import { bulkCreateMilestones, generateMilestones, getProject } from '../lib/api'
 import { formatMoney, isMoney, roundMoney } from '../lib/format'
 import type { Project } from '../lib/types'
 
@@ -18,7 +18,6 @@ export function GeneratePage() {
   const navigate = useNavigate()
   const [project, setProject] = useState<Project | null>(null)
   const [description, setDescription] = useState('')
-  const [budget, setBudget] = useState('')
   const [drafts, setDrafts] = useState<Draft[] | null>(null)
   const [problem, setProblem] = useState<unknown>(null)
   const [pending, setPending] = useState(false)
@@ -32,17 +31,22 @@ export function GeneratePage() {
       .then((next) => {
         setProject(next)
         setDescription(next.description)
-        if (next.totalAmount > 0) setBudget(String(next.totalAmount))
       })
       .catch((error: unknown) => setLoadError(error))
   }, [projectId])
 
+  const allocatedCents = project
+    ? project.milestones.reduce((total, milestone) => total + Math.round(milestone.amount * 100), 0)
+    : 0
+  const budgetCents = project ? Math.round(project.totalAmount * 100) : 0
+  const remainingCents = Math.max(0, budgetCents - allocatedCents)
+  const remainingBudget = remainingCents / 100
+
   async function onGenerate(event: FormEvent) {
     event.preventDefault()
     if (!project) return
-    const totalBudget = Number(budget)
-    if (!isMoney(totalBudget)) {
-      setProblem(new Error('Enter a budget greater than zero, with at most two decimal places.'))
+    if (!isMoney(remainingBudget)) {
+      setProblem(new Error('The project budget is already fully allocated.'))
       return
     }
     setPending(true)
@@ -52,8 +56,6 @@ export function GeneratePage() {
       const milestones = await generateMilestones({
         projectId: project.id,
         description: description.trim(),
-        totalBudget,
-        currency: project.currency,
       })
       setDrafts(
         milestones.map((milestone, index) => ({
@@ -81,30 +83,25 @@ export function GeneratePage() {
       setProblem(new Error('Each suggestion needs a title, a valid amount, and at least one criterion.'))
       return
     }
-    const sum = roundMoney(parsed.reduce((total, draft) => total + Math.round(draft.amountNumber * 100), 0))
-    const target = roundMoney(Math.round(Number(budget) * 100))
-    if (sum !== target) {
-      setProblem(new Error(`These amounts add up to ${formatMoney(sum, project.currency)}. They need to add up to ${formatMoney(target, project.currency)}. The server checks this too.`))
+    const sumCents = parsed.reduce((total, draft) => total + Math.round(draft.amountNumber * 100), 0)
+    if (sumCents <= 0 || sumCents > remainingCents) {
+      setProblem(new Error(`These amounts add up to ${formatMoney(sumCents / 100, project.currency)}. They cannot exceed the remaining ${formatMoney(remainingBudget, project.currency)}.`))
       return
     }
     setSaving(true)
     setProblem(null)
-    let saved = 0
     try {
-      for (const draft of parsed) {
-        await createMilestone(project.id, {
+      await bulkCreateMilestones(
+        project.id,
+        parsed.map((draft) => ({
           title: draft.title.trim(),
           amount: draft.amountNumber,
           criteria: draft.criteria,
-        })
-        saved += 1
-      }
+        })),
+      )
       navigate(`/projects/${project.id}`)
     } catch (error) {
       setProblem(error)
-      if (saved > 0) {
-        setProblem(new Error(`Saved ${saved} milestone${saved === 1 ? '' : 's'} before the error. The rest were not saved.`))
-      }
     } finally {
       setSaving(false)
     }
@@ -136,13 +133,15 @@ export function GeneratePage() {
           Description
           <textarea rows={5} value={description} onChange={(event) => setDescription(event.target.value)} required />
         </label>
-        <label className="field">
-          Budget for suggestions ({project.currency})
-          <input inputMode="decimal" value={budget} onChange={(event) => setBudget(event.target.value)} required />
-          <span className="hint">The model splits this budget. Amounts must add up to it before you can save. This is not a payment.</span>
-        </label>
+        <div className="field">
+          <span>Budget for suggestions ({project.currency})</span>
+          <p className="hint">
+            Project budget {formatMoney(project.totalAmount, project.currency)}. Remaining for new milestones{' '}
+            {formatMoney(remainingBudget, project.currency)}. The server uses the saved project budget.
+          </p>
+        </div>
         <ErrorNote error={!drafts ? problem : null} />
-        <button className="btn" type="submit" disabled={pending}>
+        <button className="btn" type="submit" disabled={pending || !isMoney(remainingBudget)}>
           {pending ? 'Drafting… this can take up to 30 seconds' : drafts ? 'Try again' : 'Suggest milestones'}
         </button>
         {pending && <LoadingBlock label="Writing milestones and acceptance criteria." />}
@@ -152,7 +151,7 @@ export function GeneratePage() {
           <div className="row spread">
             <h2>Review the draft</h2>
             <p>
-              {formatMoney(sum, project.currency)} of {formatMoney(Number(budget) || 0, project.currency)}
+              {formatMoney(sum, project.currency)} of {formatMoney(remainingBudget, project.currency)} remaining
             </p>
           </div>
           <ErrorNote error={problem} />
@@ -183,7 +182,7 @@ export function GeneratePage() {
               </div>
             </article>
           ))}
-          <p className="hint">Confirming adds these milestones as drafts. Milestones already on the project stay as they are.</p>
+          <p className="hint">Confirming adds these milestones as drafts in one request. Milestones already on the project stay as they are.</p>
           <button type="button" className="btn" disabled={saving} onClick={() => void onConfirm()}>
             {saving ? 'Saving…' : 'Confirm and save milestones'}
           </button>

@@ -1,4 +1,4 @@
-import { previewUrlError, screenshotError } from './format'
+import { isMoney, previewUrlError, screenshotError } from './format'
 import { SAMPLE_CLIENT, SAMPLE_FREELANCER, SAMPLE_PASSWORD, SAMPLE_PROJECT_ID } from './sample'
 import type {
   Criterion,
@@ -75,10 +75,6 @@ function cents(amount: number) {
 function recalc(db: Db, projectId: string) {
   const project = db.projects.find((item) => item.id === projectId)
   if (!project) return
-  const total = db.milestones
-    .filter((item) => item.projectId === projectId)
-    .reduce((sum, item) => sum + cents(item.amount), 0)
-  project.totalAmount = total / 100
   project.milestones = db.milestones.filter((item) => item.projectId === projectId)
 }
 
@@ -198,7 +194,9 @@ function settle(db: Db) {
     report.summary = `${completed} of ${results.length} criteria completed`
     report.screenshots = { desktop: frame('Desktop', true), mobile: frame('Mobile', false) }
     delete report.readyAt
-    if (found.milestone.status === 'verifying') found.milestone.status = 'verified'
+    if (found.milestone.status === 'verifying') {
+      // The client still has to complete verification explicitly.
+    }
   }
 }
 
@@ -306,7 +304,7 @@ export function ensureSample() {
     currency: 'USD',
     clientId: SAMPLE_CLIENT.id,
     freelancerId: SAMPLE_FREELANCER.id,
-    totalAmount: 0,
+    totalAmount: 2700,
     milestones: [],
     createdAt,
   })
@@ -317,7 +315,7 @@ export function ensureSample() {
     currency: 'USD',
     clientId: SAMPLE_CLIENT.id,
     freelancerId: null,
-    totalAmount: 0,
+    totalAmount: 1200,
     milestones: [],
     createdAt: '2026-11-03T15:10:00.000Z',
   })
@@ -662,6 +660,8 @@ export async function mockRequest(method: string, rawPath: string, body: unknown
     if (!title) details.push({ field: 'title', message: 'Title is required.' })
     if (!description) details.push({ field: 'description', message: 'Description is required.' })
     if (!/^[A-Z]{3}$/.test(currency)) details.push({ field: 'currency', message: 'Use a 3-letter currency code.' })
+    const budgetError = moneyError(data.totalBudget, 'totalBudget')
+    if (budgetError) return budgetError
     if (details.length) return fail(400, 'VALIDATION_ERROR', 'Check the highlighted fields.', details)
     const project: Project = {
       id: id('proj'),
@@ -670,7 +670,7 @@ export async function mockRequest(method: string, rawPath: string, body: unknown
       currency,
       clientId: user.id,
       freelancerId: null,
-      totalAmount: 0,
+      totalAmount: data.totalBudget as number,
       milestones: [],
       createdAt: now(),
     }
@@ -687,6 +687,68 @@ export async function mockRequest(method: string, rawPath: string, body: unknown
   }
 
   const projectMatch = path.match(/^\/api\/projects\/([^/]+)$/)
+  if (verb === 'PATCH' && projectMatch) {
+    const project = db.projects.find((item) => item.id === projectMatch[1])
+    if (!project) return fail(404, 'NOT_FOUND', 'Project not found.')
+    if (project.clientId !== user.id) return fail(403, 'FORBIDDEN', 'Only the client can edit this project.')
+    const data = readBody(body)
+    if ('title' in data) {
+      const title = String(data.title ?? '').trim()
+      if (title.length < 3) return fail(400, 'VALIDATION_ERROR', 'Title must be at least 3 characters.', [{ field: 'title', message: 'Too short.' }])
+      project.title = title
+    }
+    if ('description' in data) {
+      const description = String(data.description ?? '').trim()
+      if (description.length < 10) return fail(400, 'VALIDATION_ERROR', 'Description must be at least 10 characters.', [{ field: 'description', message: 'Too short.' }])
+      project.description = description
+    }
+    if ('totalBudget' in data) {
+      const budgetError = moneyError(data.totalBudget, 'totalBudget')
+      if (budgetError) return budgetError
+      const allocated = db.milestones.filter((item) => item.projectId === project.id).reduce((sum, item) => sum + cents(item.amount), 0)
+      if (cents(data.totalBudget as number) < allocated) {
+        return fail(409, 'INVALID_STATE', 'Budget cannot be lower than the allocated milestone amounts')
+      }
+      project.totalAmount = data.totalBudget as number
+    }
+    save(db)
+    return { status: 200, body: projectView(db, project) }
+  }
+
+  const projectPayments = path.match(/^\/api\/projects\/([^/]+)\/payments$/)
+  if (verb === 'GET' && projectPayments) {
+    const project = db.projects.find((item) => item.id === projectPayments[1])
+    if (!project) return fail(404, 'NOT_FOUND', 'Project not found.')
+    if (!isParticipant(user, project)) return fail(403, 'FORBIDDEN', 'You do not have access to this project.')
+    const milestoneIds = new Set(db.milestones.filter((item) => item.projectId === project.id).map((item) => item.id))
+    const payments = db.payments
+      .filter((item) => milestoneIds.has(item.milestoneId))
+      .sort((a, b) => (b.createdAt ?? '').localeCompare(a.createdAt ?? ''))
+    return { status: 200, body: { payments } }
+  }
+
+  if (verb === 'POST' && path === '/api/ai/revision-suggestions') {
+    const milestoneId = String(readBody(body).milestoneId ?? '')
+    const found = projectForMilestone(db, milestoneId)
+    if (!found) return fail(404, 'NOT_FOUND', 'Milestone not found.')
+    if (!isParticipant(user, found.project)) return fail(403, 'FORBIDDEN', 'You do not have access to this milestone.')
+    const latest = latestSubmission(db, found.milestone.id)
+    if (!latest) return fail(404, 'NOT_FOUND', 'No submission yet.')
+    const report = db.reports.find((item) => item.submissionId === latest.id && item.state === 'done')
+    if (!report) return fail(409, 'NO_REPORT', 'A completed verification report is required first')
+    const suggestions = found.milestone.criteria
+      .filter((criterion) => report.results.some((result) => result.criterionId === criterion.id && result.status !== 'completed'))
+      .map((criterion) => {
+        const result = report.results.find((item) => item.criterionId === criterion.id)
+        return {
+          criterionId: criterion.id,
+          criterion: criterion.text,
+          suggestion: `Open the preview again and make this checkable: ${criterion.text}. The inspector found: ${result?.evidence ?? 'no matching evidence'}.`,
+        }
+      })
+    return { status: 200, body: { suggestions } }
+  }
+
   if (verb === 'GET' && projectMatch) {
     const project = db.projects.find((item) => item.id === projectMatch[1])
     if (!project) return fail(404, 'NOT_FOUND', 'Project not found.')
@@ -713,6 +775,44 @@ export async function mockRequest(method: string, rawPath: string, body: unknown
     return { status: 200, body: projectView(db, project) }
   }
 
+  const bulkMilestones = path.match(/^\/api\/projects\/([^/]+)\/milestones\/bulk$/)
+  if (verb === 'POST' && bulkMilestones) {
+    const project = db.projects.find((item) => item.id === bulkMilestones[1])
+    if (!project) return fail(404, 'NOT_FOUND', 'Project not found.')
+    if (project.clientId !== user.id) return fail(403, 'FORBIDDEN', 'Only the client can add milestones.')
+    const rows = Array.isArray(readBody(body).milestones) ? (readBody(body).milestones as unknown[]) : []
+    if (!rows.length || rows.length > 20) return fail(400, 'VALIDATION_ERROR', 'Add between 1 and 20 milestones.')
+    const existingCents = db.milestones.filter((item) => item.projectId === project.id).reduce((sum, item) => sum + cents(item.amount), 0)
+    let newCents = 0
+    const prepared: Milestone[] = []
+    for (const row of rows) {
+      const data = readBody(row)
+      const title = String(data.title ?? '').trim()
+      if (title.length < 3) return fail(400, 'VALIDATION_ERROR', 'Give every milestone a title.', [{ field: 'title', message: 'Title is required.' }])
+      const amountError = moneyError(data.amount, 'amount')
+      if (amountError) return amountError
+      const criteria = criteriaFrom(data.criteria)
+      if (!isCriteria(criteria)) return criteria
+      newCents += cents(data.amount as number)
+      prepared.push({
+        id: id('ms'),
+        projectId: project.id,
+        title,
+        amount: data.amount as number,
+        currency: project.currency,
+        status: 'draft',
+        criteria,
+      })
+    }
+    if (existingCents + newCents > cents(project.totalAmount)) {
+      return fail(409, 'INVALID_STATE', 'Milestone amounts exceed the remaining project budget')
+    }
+    db.milestones.push(...prepared)
+    recalc(db, project.id)
+    save(db)
+    return { status: 201, body: { milestones: prepared } }
+  }
+
   const createMilestone = path.match(/^\/api\/projects\/([^/]+)\/milestones$/)
   if (verb === 'POST' && createMilestone) {
     const project = db.projects.find((item) => item.id === createMilestone[1])
@@ -723,6 +823,10 @@ export async function mockRequest(method: string, rawPath: string, body: unknown
     if (!title) return fail(400, 'VALIDATION_ERROR', 'Give the milestone a title.', [{ field: 'title', message: 'Title is required.' }])
     const amountError = moneyError(data.amount, 'amount')
     if (amountError) return amountError
+    const existingCents = db.milestones.filter((item) => item.projectId === project.id).reduce((sum, item) => sum + cents(item.amount), 0)
+    if (existingCents + cents(data.amount as number) > cents(project.totalAmount)) {
+      return fail(409, 'INVALID_STATE', 'Milestone amount exceeds the remaining project budget')
+    }
     const criteria = criteriaFrom(data.criteria)
     if (!isCriteria(criteria)) return criteria
     const milestone: Milestone = {
@@ -747,18 +851,15 @@ export async function mockRequest(method: string, rawPath: string, body: unknown
     if (!project) return fail(404, 'NOT_FOUND', 'Project not found.')
     if (project.clientId !== user.id) return fail(403, 'FORBIDDEN', 'You can only generate milestones for your own project.')
     const description = String(data.description ?? '').trim()
-    const currency = String(data.currency ?? '').trim().toUpperCase()
     const details = []
     if (!description) details.push({ field: 'description', message: 'Describe the work first.' })
-    const amountError = moneyError(data.totalBudget, 'totalBudget')
-    if (!amountError && currency !== project.currency) {
-      details.push({ field: 'currency', message: 'Use the project currency.' })
-    }
     if (details.length) return fail(400, 'VALIDATION_ERROR', 'Check the suggestion form.', details)
-    if (amountError) return amountError
+    if (!isMoney(project.totalAmount)) {
+      return fail(409, 'INVALID_STATE', 'Project budget is not configured')
+    }
     return {
       status: 200,
-      body: { milestones: suggestionsFor(description, data.totalBudget as number) },
+      body: { milestones: suggestionsFor(description, project.totalAmount) },
     }
   }
 
@@ -802,12 +903,52 @@ export async function mockRequest(method: string, rawPath: string, body: unknown
   if (verb === 'POST' && approveCriteria) {
     const found = projectForMilestone(db, approveCriteria[1])
     if (!found) return fail(404, 'NOT_FOUND', 'Milestone not found.')
-    if (found.project.clientId !== user.id) return fail(403, 'FORBIDDEN', 'Only the client can approve criteria.')
+    if (found.project.freelancerId !== user.id) return fail(403, 'FORBIDDEN', 'Only the assigned freelancer can approve criteria.')
     if (found.milestone.status !== 'draft') return fail(409, 'INVALID_STATUS', 'Criteria are already approved.')
     if (found.milestone.criteria.length === 0) {
       return fail(400, 'VALIDATION_ERROR', 'Add at least one criterion before approving.')
     }
     found.milestone.status = 'criteria_approved'
+    save(db)
+    return { status: 200, body: found.milestone }
+  }
+
+  const startMatch = path.match(/^\/api\/milestones\/([^/]+)\/start$/)
+  if (verb === 'POST' && startMatch) {
+    const found = projectForMilestone(db, startMatch[1])
+    if (!found) return fail(404, 'NOT_FOUND', 'Milestone not found.')
+    if (found.project.freelancerId !== user.id) return fail(403, 'FORBIDDEN', 'Only the assigned freelancer can start this milestone.')
+    if (found.milestone.status !== 'criteria_approved') return fail(409, 'INVALID_STATUS', 'Milestone must have approved criteria before work can start')
+    found.milestone.status = 'in_progress'
+    save(db)
+    return { status: 200, body: found.milestone }
+  }
+
+  const startVerificationMatch = path.match(/^\/api\/milestones\/([^/]+)\/start-verification$/)
+  if (verb === 'POST' && startVerificationMatch) {
+    const found = projectForMilestone(db, startVerificationMatch[1])
+    if (!found) return fail(404, 'NOT_FOUND', 'Milestone not found.')
+    if (found.project.clientId !== user.id) return fail(403, 'FORBIDDEN', 'Only the project owner can start verification')
+    if (found.milestone.status !== 'submitted') return fail(409, 'INVALID_STATUS', 'Only submitted milestones can enter verification')
+    found.milestone.status = 'verifying'
+    save(db)
+    return { status: 200, body: found.milestone }
+  }
+
+  const completeVerificationMatch = path.match(/^\/api\/milestones\/([^/]+)\/complete-verification$/)
+  if (verb === 'POST' && completeVerificationMatch) {
+    const found = projectForMilestone(db, completeVerificationMatch[1])
+    if (!found) return fail(404, 'NOT_FOUND', 'Milestone not found.')
+    if (found.project.clientId !== user.id) return fail(403, 'FORBIDDEN', 'Only the project owner can complete verification')
+    if (found.milestone.status !== 'verifying') return fail(409, 'INVALID_STATUS', 'Milestone must be under verification first')
+    const reportId = String(readBody(body).reportId ?? '')
+    const latest = latestSubmission(db, found.milestone.id)
+    const report = latest ? db.reports.find((item) => item.submissionId === latest.id && item.state === 'done') : undefined
+    if (!report || report.id !== reportId) return fail(404, 'REPORT_NOT_FOUND', 'Completed verification report not found')
+    if (!report.results.length || !report.results.every((result) => result.status === 'completed')) {
+      return fail(409, 'VERIFICATION_FAILED', 'Milestone cannot be verified because not all criteria passed independent browser verification')
+    }
+    found.milestone.status = 'verified'
     save(db)
     return { status: 200, body: found.milestone }
   }
@@ -866,7 +1007,7 @@ export async function mockRequest(method: string, rawPath: string, body: unknown
     if (!submissionRow) return fail(404, 'NOT_FOUND', 'Submission not found.')
     const found = projectForMilestone(db, submissionRow.milestoneId)
     if (!found) return fail(404, 'NOT_FOUND', 'Milestone not found.')
-    if (!isParticipant(user, found.project)) return fail(403, 'FORBIDDEN', 'Only people on this project can start verification.')
+    if (user.role !== 'client' || found.project.clientId !== user.id) return fail(403, 'FORBIDDEN', 'Only the project owner can start verification.')
     if (found.milestone.status !== 'submitted' && found.milestone.status !== 'verifying') {
       return fail(409, 'INVALID_STATUS', 'Verification starts after evidence is submitted.')
     }
@@ -921,6 +1062,9 @@ export async function mockRequest(method: string, rawPath: string, body: unknown
     const latest = latestSubmission(db, found.milestone.id)
     const report = latest ? db.reports.find((item) => item.submissionId === latest.id && item.state === 'done') : undefined
     if (!report || report.id !== reportId) return fail(400, 'VALIDATION_ERROR', 'Choose the current report before approving.', [{ field: 'reportId', message: 'Report id does not match the latest report.' }])
+    if (!report.results.length || !report.results.every((result) => result.status === 'completed')) {
+      return fail(409, 'VERIFICATION_FAILED', 'Milestone cannot be approved because not all criteria passed independent browser verification')
+    }
     found.milestone.status = 'approved'
     delete found.milestone.rejectionReason
     save(db)
@@ -932,9 +1076,9 @@ export async function mockRequest(method: string, rawPath: string, body: unknown
     const found = projectForMilestone(db, rejectMatch[1])
     if (!found) return fail(404, 'NOT_FOUND', 'Milestone not found.')
     if (found.project.clientId !== user.id) return fail(403, 'FORBIDDEN', 'Only the client can reject the work.')
-    if (found.milestone.status !== 'verified') return fail(409, 'INVALID_STATUS', 'Reject the work after the report is ready.')
+    if (!['submitted', 'verifying', 'verified'].includes(found.milestone.status)) return fail(409, 'INVALID_STATUS', 'Only submitted or reviewed milestones can be rejected')
     const reason = String(readBody(body).reason ?? '').trim()
-    if (!reason) return fail(400, 'VALIDATION_ERROR', 'A reason is required.', [{ field: 'reason', message: 'Tell the freelancer what to change.' }])
+    if (reason.length < 10) return fail(400, 'VALIDATION_ERROR', 'A reason of at least 10 characters is required.', [{ field: 'reason', message: 'Tell the freelancer what to change.' }])
     found.milestone.status = 'rejected'
     found.milestone.rejectionReason = reason
     save(db)
@@ -963,7 +1107,8 @@ export async function mockRequest(method: string, rawPath: string, body: unknown
       amount: found.milestone.amount,
       currency: found.milestone.currency,
       paidAt: null,
-    })
+      createdAt: now(),
+    } as Payment & { createdAt?: string })
     save(db)
     return { status: 201, body: { orderId, amount: found.milestone.amount, currency: found.milestone.currency } }
   }

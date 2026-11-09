@@ -12,9 +12,15 @@ import Submission from "../models/Submission";
 import { requireAuth } from "../middleware/auth.middleware";
 import { sendError } from "../utils/errors";
 
-import { updateMilestoneSchema } from "../validators/milestone.validator";
+import {
+  createMilestoneSchema,
+  bulkCreateMilestonesSchema,
+  rejectMilestoneSchema,
+  updateMilestoneSchema,
+} from "../validators/milestone.validator";
 import { createSubmissionSchema } from "../validators/submission.validator";
 import { hasPassedVerification } from "../services/verifier";
+import { recordAudit } from "../utils/audit";
 
 const router = Router();
 
@@ -188,6 +194,13 @@ router.post("/:id/approve-criteria", async (req, res) => {
       );
     }
 
+    recordAudit({
+      actorId: req.user!._id,
+      projectId: project._id,
+      milestoneId: milestone._id,
+      eventType: "milestone.criteria_approved",
+    });
+
     return res.status(200).json({ milestone: updated });
   } catch (error) {
     console.error("Approve criteria error:", error);
@@ -243,6 +256,13 @@ router.post("/:id/start", async (req, res) => {
         "Milestone must have approved criteria before work can start"
       );
     }
+
+    recordAudit({
+      actorId: req.user!._id,
+      projectId: project._id,
+      milestoneId: milestone._id,
+      eventType: "milestone.started",
+    });
 
     return res.status(200).json({ milestone: updated });
   } catch (error) {
@@ -338,6 +358,7 @@ router.post(
         freelancerId: req.user!._id,
         description: parsed.data.description,
         previewUrl: parsed.data.previewUrl,
+        screenshots: parsed.data.screenshots ?? [],
         source: "freelancer_claim",
       });
 
@@ -407,6 +428,14 @@ router.post(
           );
         }
       }
+      recordAudit({
+        actorId: req.user!._id,
+        projectId: project._id,
+        milestoneId: milestone._id,
+        eventType: "submission.created",
+        eventData: { submissionId: submission._id },
+      });
+
       // 11. Return response
       return res.status(201).json({
         message: "Submission created successfully",
@@ -539,6 +568,14 @@ router.post("/:id/approve", async (req, res) => {
       );
     }
 
+    recordAudit({
+      actorId: req.user!._id,
+      projectId: project._id,
+      milestoneId: milestone._id,
+      eventType: "milestone.approved",
+      eventData: { reportId: parsed.data.reportId },
+    });
+
     const updatedMilestone = await Milestone.findById(id);
 
     return res.status(200).json({
@@ -552,6 +589,104 @@ router.post("/:id/approve", async (req, res) => {
       500,
       "SERVER_ERROR",
       "Unable to approve milestone"
+    );
+  }
+});
+
+// POST /api/milestones/:id/reject
+// Client sends submitted or reviewed work back to the freelancer.
+router.post("/:id/reject", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!isValidId(id)) {
+      return sendError(res, 400, "INVALID_ID", "Invalid milestone ID");
+    }
+
+    const parsed = rejectMilestoneSchema.safeParse(req.body);
+
+    if (!parsed.success) {
+      return sendError(
+        res,
+        400,
+        "VALIDATION_ERROR",
+        "Invalid rejection data",
+        parsed.error.issues
+      );
+    }
+
+    if (req.user!.role !== "client") {
+      return sendError(
+        res,
+        403,
+        "FORBIDDEN",
+        "Only the client can reject a milestone"
+      );
+    }
+
+    const milestone = await Milestone.findById(id);
+
+    if (!milestone) {
+      return sendError(res, 404, "NOT_FOUND", "Milestone not found");
+    }
+
+    const project = await Project.findById(milestone.projectId);
+
+    if (!project) {
+      return sendError(res, 404, "PROJECT_NOT_FOUND", "Project not found");
+    }
+
+    if (project.clientId.toString() !== req.user!._id.toString()) {
+      return sendError(
+        res,
+        403,
+        "FORBIDDEN",
+        "Only the project owner can reject this milestone"
+      );
+    }
+
+    const updated = await Milestone.findOneAndUpdate(
+      {
+        _id: milestone._id,
+        status: { $in: ["submitted", "verifying", "verified"] },
+      },
+      {
+        $set: {
+          status: "rejected",
+          rejectionReason: parsed.data.reason,
+        },
+      },
+      { new: true, runValidators: true }
+    );
+
+    if (!updated) {
+      return sendError(
+        res,
+        409,
+        "INVALID_STATUS",
+        "Only submitted or reviewed milestones can be rejected"
+      );
+    }
+
+    recordAudit({
+      actorId: req.user!._id,
+      projectId: project._id,
+      milestoneId: milestone._id,
+      eventType: "milestone.rejected",
+      eventData: { reason: parsed.data.reason },
+    });
+
+    return res.status(200).json({
+      message: "Milestone rejected successfully",
+      milestone: updated,
+    });
+  } catch (error) {
+    console.error("Reject milestone error:", error);
+    return sendError(
+      res,
+      500,
+      "SERVER_ERROR",
+      "Unable to reject milestone"
     );
   }
 });
@@ -651,6 +786,13 @@ router.post("/:id/start-verification", async (req, res) => {
         "Only submitted milestones can enter verification"
       );
     }
+
+    recordAudit({
+      actorId: req.user!._id,
+      projectId: project._id,
+      milestoneId: milestone._id,
+      eventType: "milestone.verification_started",
+    });
 
     return res.status(200).json({ milestone: updated });
   } catch (error) {
@@ -764,6 +906,14 @@ router.post("/:id/complete-verification", async (req, res) => {
         "Milestone status changed. Refresh and try again."
       );
     }
+
+    recordAudit({
+      actorId: req.user!._id,
+      projectId: project._id,
+      milestoneId: milestone._id,
+      eventType: "milestone.verified",
+      eventData: { reportId: parsed.data.reportId },
+    });
 
     const updatedMilestone = await Milestone.findById(id);
 
