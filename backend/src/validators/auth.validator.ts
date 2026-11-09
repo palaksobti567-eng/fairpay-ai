@@ -21,6 +21,8 @@ export const registerSchema = z.object({
     .toLowerCase(),
 
   password: passwordSchema,
+
+  role: z.enum(["client", "freelancer"]),
 }).strict();
 
 export const loginSchema = z.object({
@@ -34,4 +36,3 @@ export const loginSchema = z.object({
 
 export type RegisterInput = z.infer<typeof registerSchema>;
 export type LoginInput = z.infer<typeof loginSchema>;
-

@@ -24,8 +24,7 @@ router.post("/register", async (req, res) => {
       );
     }
 
-    const { name, email, password } = parsed.data;
-
+    const { name, email, password, role } = parsed.data;
     const existingUser = await User.findOne({ email });
 
     if (existingUser) {
@@ -43,7 +42,7 @@ router.post("/register", async (req, res) => {
       name,
       email,
       passwordHash,
-      role: "client",
+      role,
     });
 
     const token = generateToken(user._id.toString());
