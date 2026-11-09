@@ -110,13 +110,29 @@ async function request<T>(path: string, method = 'GET', body?: unknown): Promise
 function asObject(value: unknown) {
   return value && typeof value === 'object' ? (value as Record<string, unknown>) : {}
 }
-
 function asList<T>(value: unknown, key: string): T[] {
   if (Array.isArray(value)) return value as T[]
   const wrapped = asObject(value)[key]
   return Array.isArray(wrapped) ? (wrapped as T[]) : []
 }
+function normalizeProject(value: unknown): Project {
+  const item = asObject(value)
 
+  return {
+    id: String(item.id ?? item._id ?? ''),
+    title: String(item.title ?? ''),
+    description: String(item.description ?? ''),
+    currency: String(item.currency ?? ''),
+    clientId: String(item.clientId ?? ''),
+    freelancerId:
+      item.freelancerId == null ? null : String(item.freelancerId),
+    totalAmount: Number(item.totalAmount ?? item.totalBudget ?? 0),
+    milestones: Array.isArray(item.milestones)
+      ? (item.milestones as Milestone[])
+      : [],
+    createdAt: String(item.createdAt ?? ''),
+  }
+}
 function criteriaTexts(value: unknown) {
   if (!Array.isArray(value)) return []
   return value
@@ -144,35 +160,35 @@ export async function me() {
 
 export async function listProjects() {
   const body = await request<unknown>('/api/projects')
-  return asList<Project>(body, 'projects')
+  return asList<unknown>(body, 'projects').map(normalizeProject)
 }
-
 export async function createProject(input: {
   title: string
   description: string
   currency: string
   totalBudget: number
 }) {
-  const body = await request<Project | { project: Project }>(
-    '/api/projects',
-    'POST',
-    input
-  )
+  const body = await request<unknown>('/api/projects', 'POST', input)
   const wrapped = asObject(body).project
-  return (wrapped as Project | undefined) ?? (body as Project)
+  return normalizeProject(wrapped ?? body)
 }
 export async function getProject(id: string) {
-  const body = await request<Project | { project: Project }>(`/api/projects/${id}`)
+  const body = await request<unknown>(`/api/projects/${id}`)
   const wrapped = asObject(body).project
-  return (wrapped as Project | undefined) ?? (body as Project)
+  return normalizeProject(wrapped ?? body)
 }
-
-export async function inviteFreelancer(projectId: string, freelancerEmail: string) {
-  const body = await request<Project | { project: Project }>(`/api/projects/${projectId}/invite`, 'POST', { freelancerEmail })
+export async function inviteFreelancer(
+  projectId: string,
+  freelancerEmail: string,
+) {
+  const body = await request<unknown>(
+    `/api/projects/${projectId}/invite`,
+    'POST',
+    { freelancerEmail },
+  )
   const wrapped = asObject(body).project
-  return (wrapped as Project | undefined) ?? (body as Project)
+  return normalizeProject(wrapped ?? body)
 }
-
 export async function createMilestone(
   projectId: string,
   input: { title: string; amount: number; criteria: string[] },
