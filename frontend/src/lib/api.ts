@@ -147,12 +147,20 @@ export async function listProjects() {
   return asList<Project>(body, 'projects')
 }
 
-export async function createProject(input: { title: string; description: string; currency: string }) {
-  const body = await request<Project | { project: Project }>('/api/projects', 'POST', input)
+export async function createProject(input: {
+  title: string
+  description: string
+  currency: string
+  totalBudget: number
+}) {
+  const body = await request<Project | { project: Project }>(
+    '/api/projects',
+    'POST',
+    input
+  )
   const wrapped = asObject(body).project
   return (wrapped as Project | undefined) ?? (body as Project)
 }
-
 export async function getProject(id: string) {
   const body = await request<Project | { project: Project }>(`/api/projects/${id}`)
   const wrapped = asObject(body).project

@@ -14,6 +14,7 @@ export function NewProjectPage() {
   const [title, setTitle] = useState('')
   const [description, setDescription] = useState('')
   const [currency, setCurrency] = useState('USD')
+  const [budget, setBudget] = useState('')
   const [problem, setProblem] = useState<unknown>(null)
   const [pending, setPending] = useState(false)
 
@@ -26,7 +27,20 @@ export function NewProjectPage() {
     setPending(true)
     setProblem(null)
     try {
-      const project = await createProject({ title: title.trim(), description: description.trim(), currency })
+      const totalBudget = Number(budget)
+
+if (!Number.isFinite(totalBudget) || totalBudget <= 0 || !Number.isInteger(totalBudget * 100)) {
+  setProblem('Enter a valid positive budget with at most 2 decimal places.')
+  setPending(false)
+  return
+}
+
+const project = await createProject({
+  title: title.trim(),
+  description: description.trim(),
+  currency,
+  totalBudget,
+})
       navigate(`/projects/${project.id}`)
     } catch (error) {
       setProblem(error)
@@ -54,6 +68,18 @@ export function NewProjectPage() {
           Description
           <textarea rows={5} value={description} onChange={(event) => setDescription(event.target.value)} required />
         </label>
+<label className="field">
+  Total Budget
+  <input
+    type="number"
+    min="0.01"
+    step="0.01"
+    value={budget}
+    onChange={(event) => setBudget(event.target.value)}
+    required
+  />
+  <span className="hint">Enter the total amount available for this project.</span>
+</label>
         <label className="field">
           Currency
           <select value={currency} onChange={(event) => setCurrency(event.target.value)}>
