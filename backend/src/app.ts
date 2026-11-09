@@ -11,7 +11,30 @@ import express from "express";
 import { connectDB } from "./config/db";
 import paymentRoutes from "./routes/payment.routes";
 import paymentStatusRoutes from "./routes/payment-status.routes";
+import cors from "cors";
 const app = express();
+const allowedOrigins = [
+  "https://fairpay-ai-frontend.vercel.app",
+  "http://localhost:5173",
+];
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      const isVercelPreview =
+        origin?.startsWith("https://fairpay-ai-frontend-") &&
+        origin.endsWith("-palaksobti567-7287s-projects.vercel.app");
+
+      if (!origin || allowedOrigins.includes(origin) || isVercelPreview) {
+        callback(null, true);
+      } else {
+        callback(new Error("Not allowed by CORS"));
+      }
+    },
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
 
 app.use(express.json());
 app.use("/api/screenshots", screenshotRoutes);
