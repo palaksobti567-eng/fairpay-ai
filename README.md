@@ -10,7 +10,7 @@ Built for the PayPal AI Hackathon 2026.
 
 ## Links
 
-- **Demo video (under 3 min):** `ADD_YOUTUBE_LINK`
+- **Demo video (under 3 min):** https://youtu.be/FKRk3LsXWWQ
 - **Hosted demo (frontend):** https://fairpay-ai-frontend.vercel.app
 - **Hosted API (backend):** https://fairpay-ai.onrender.com
 - **Note:** the demo runs on free hosting. The first request after a pause can take about a minute to wake up.
